@@ -10,13 +10,19 @@ import (
 )
 
 func TestWAL(t *testing.T) {
+	origMaxSegmentSize := maxSegmentSize
+	defer func() {
+		maxSegmentSize = origMaxSegmentSize
+	}()
+	maxSegmentSize = 5
+
 	dir, err := ioutil.TempDir("", "waltest")
 	if !assert.NoError(t, err) {
 		return
 	}
 	defer os.RemoveAll(dir)
 
-	wal, err := Open(dir, nil, 0)
+	wal, err := Open(dir, 0)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -58,14 +64,9 @@ func TestWAL(t *testing.T) {
 		return
 	}
 
-	o := wal.Offset()
-	if !assert.EqualValues(t, 10, o.Position()) {
-		return
-	}
-
 	// Reopen WAL
 	wal.Close()
-	wal, err = Open(dir, o, 0)
+	wal, err = Open(dir, 0)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -74,14 +75,6 @@ func TestWAL(t *testing.T) {
 	if !testReadWrite("3") {
 		return
 	}
-
-	// Reopen WAL at beginning
-	wal.Close()
-	wal, err = Open(dir, newOffset(o.FileSequence(), 0), 0)
-	if !assert.NoError(t, err) {
-		return
-	}
-	defer wal.Close()
 
 	r, err = wal.NewReader(nil)
 	if !assert.NoError(t, err) {
@@ -100,7 +93,7 @@ func TestWAL(t *testing.T) {
 	}
 
 	// Truncate as of known offset, should not delete any files
-	testTruncate(t, wal, o, 1)
+	testTruncate(t, wal, r.Offset(), 1)
 
 	// Truncate as of now, which should remove old log segment
 	testTruncate(t, wal, newOffset(time.Now().UnixNano(), 0), 0)

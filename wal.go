@@ -15,14 +15,11 @@ import (
 	"github.com/getlantern/golog"
 )
 
-const (
-	maxSegmentSize = 10485760
-)
-
 var (
 	log = golog.LoggerFor("wal")
 
-	encoding = binary.BigEndian
+	maxSegmentSize = int64(10485760)
+	encoding       = binary.BigEndian
 )
 
 type filebased struct {
@@ -33,18 +30,12 @@ type filebased struct {
 	open         func(filename string, position int64) (*os.File, error)
 }
 
-func (fb *filebased) advance(offset Offset) (err error) {
-	if offset != nil {
-		fb.fileSequence = offset.FileSequence()
-		fb.position = offset.Position()
-	} else {
-		fb.fileSequence = time.Now().UnixNano()
-		fb.position = 0
-	}
+func (fb *filebased) openFile() error {
+	var err error
 	if fb.file != nil {
 		err = fb.file.Close()
 		if err != nil {
-			return err
+			log.Errorf("Unable to close existing file %v: %v", fb.file.Name(), err)
 		}
 	}
 	fb.file, err = fb.open(filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence)), fb.position)
@@ -59,20 +50,46 @@ type WAL struct {
 	mx            sync.RWMutex
 }
 
-func Open(dir string, offset Offset, syncInterval time.Duration) (*WAL, error) {
+func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	wal := &WAL{filebased: filebased{dir: dir, open: func(filename string, position int64) (*os.File, error) {
 		return os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	}}}
-	err := wal.advance(offset)
+	// Append to latest file if available
+	files, err := ioutil.ReadDir(wal.dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Unable to list existing log files: %v", err)
 	}
-	wal.bufWriter = bufio.NewWriter(wal.file)
+
+	if len(files) > 0 {
+		// Files are sorted by name, so the last in the list is the latest
+		latestFile := files[len(files)-1]
+		if latestFile.Size() < maxSegmentSize {
+			wal.position = latestFile.Size()
+			wal.fileSequence, err = strconv.ParseInt(latestFile.Name(), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("Unable to parse file sequence from filename %v: %v", latestFile.Name(), err)
+			}
+			err := wal.openFile()
+			if err != nil {
+				return nil, err
+			}
+			wal.bufWriter = bufio.NewWriter(wal.file)
+		}
+	}
+
+	if wal.file == nil {
+		err := wal.advance()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if syncInterval <= 0 {
 		wal.syncImmediate = true
 	} else {
 		go wal.sync(syncInterval)
 	}
+
 	return wal, nil
 }
 
@@ -97,22 +114,14 @@ func (wal *WAL) Write(b []byte) (int, error) {
 	}
 
 	wal.position += int64(n)
-	if wal.position > maxSegmentSize {
-		err = wal.advance(nil)
+	if wal.position >= maxSegmentSize {
+		err = wal.advance()
 		if err != nil {
 			return n, fmt.Errorf("Unable to advance to next file: %v", err)
 		}
-		wal.bufWriter = bufio.NewWriter(wal.file)
 	}
 
 	return n, nil
-}
-
-func (wal *WAL) Offset() Offset {
-	wal.mx.RLock()
-	o := newOffset(wal.fileSequence, wal.position)
-	wal.mx.RUnlock()
-	return o
 }
 
 func (wal *WAL) TruncateBefore(o Offset) error {
@@ -146,6 +155,16 @@ func (wal *WAL) Close() error {
 	return closeErr
 }
 
+func (wal *WAL) advance() error {
+	wal.fileSequence = time.Now().UnixNano()
+	wal.position = 0
+	err := wal.openFile()
+	if err == nil {
+		wal.bufWriter = bufio.NewWriter(wal.file)
+	}
+	return err
+}
+
 func (wal *WAL) sync(syncInterval time.Duration) {
 	for {
 		time.Sleep(syncInterval)
@@ -171,7 +190,6 @@ type Reader struct {
 	filebased
 	wal       *WAL
 	bufReader *bufio.Reader
-	mx        sync.Mutex
 }
 
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
@@ -191,27 +209,16 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		return nil, fmt.Errorf("No log files, can't open reader")
 	}
 
-	if offset == nil {
-		fileSequence, parseErr := strconv.ParseInt(files[0].Name(), 10, 64)
-		if parseErr != nil {
-			return nil, fmt.Errorf("Unable to parse log file name %v: %v", files[0].Name(), parseErr)
-		}
-		offset = newOffset(fileSequence, 0)
-	}
-
-	err = r.advance(offset)
+	err = r.advance()
 	if err != nil {
 		return nil, err
 	}
-	r.bufReader = bufio.NewReader(r.file)
 	return r, nil
 }
 
 func (r *Reader) Read() ([]byte, error) {
 	r.wal.mx.RLock()
 	defer r.wal.mx.RUnlock()
-	r.mx.Lock()
-	defer r.mx.Unlock()
 
 	// Read length
 	lenBuf := make([]byte, 4)
@@ -251,17 +258,52 @@ func (r *Reader) Read() ([]byte, error) {
 		}
 	}
 
-	if r.position > maxSegmentSize {
-		err := r.advance(nil)
+	if r.position >= maxSegmentSize {
+		err := r.advance()
 		if err != nil {
 			return nil, err
 		}
-		r.bufReader = bufio.NewReader(r.file)
 	}
 
 	return b, nil
 }
 
+func (r *Reader) Offset() Offset {
+	return newOffset(r.fileSequence, r.position)
+}
+
 func (r *Reader) Close() error {
 	return r.file.Close()
+}
+
+func (r *Reader) advance() error {
+	files, err := ioutil.ReadDir(r.dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list existing log files: %v", err)
+	}
+
+	cutoff := fmt.Sprintf("%d", r.fileSequence)
+	for _, fileInfo := range files {
+		if fileInfo.Name() > cutoff {
+			// Files are sorted by name, if we've gotten past the cutoff, don't bother
+			// continuing
+			r.position = 0
+			r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
+			if err != nil {
+				return fmt.Errorf("Unable to parse file sequence from filename %v: %v", fileInfo.Name(), err)
+			}
+			err := r.openFile()
+			if err != nil {
+				return err
+			}
+			_, err = r.file.Seek(r.position, 0)
+			if err != nil {
+				return err
+			}
+			r.bufReader = bufio.NewReader(r.file)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("No file found past position %d", r.position)
 }
