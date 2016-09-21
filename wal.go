@@ -47,7 +47,7 @@ type WAL struct {
 	filebased
 	syncImmediate bool
 	bufWriter     *bufio.Writer
-	mx            sync.RWMutex
+	mx            sync.Mutex
 }
 
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
@@ -96,6 +96,7 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 func (wal *WAL) Write(b []byte) (int, error) {
 	wal.mx.Lock()
 	defer wal.mx.Unlock()
+
 	lenBuf := make([]byte, 4)
 	encoding.PutUint32(lenBuf, uint32(len(b)))
 	n, err := wal.bufWriter.Write(lenBuf)
@@ -188,12 +189,11 @@ func (wal *WAL) doSync() {
 
 type Reader struct {
 	filebased
-	wal       *WAL
 	bufReader *bufio.Reader
 }
 
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
-	r := &Reader{wal: wal, filebased: filebased{dir: wal.dir, open: func(filename string, position int64) (*os.File, error) {
+	r := &Reader{filebased: filebased{dir: wal.dir, open: func(filename string, position int64) (*os.File, error) {
 		file, err := os.OpenFile(filename, os.O_RDONLY, 0600)
 		if err == nil {
 			_, err = file.Seek(position, 0)
@@ -217,9 +217,6 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 }
 
 func (r *Reader) Read() ([]byte, error) {
-	r.wal.mx.RLock()
-	defer r.wal.mx.RUnlock()
-
 	// Read length
 	lenBuf := make([]byte, 4)
 	read := 0
