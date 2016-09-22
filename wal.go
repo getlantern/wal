@@ -43,8 +43,12 @@ func (fb *filebased) openFile() error {
 			log.Errorf("Unable to close existing file %v: %v", fb.file.Name(), err)
 		}
 	}
-	fb.file, err = os.OpenFile(filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence)), fb.fileFlags, 0600)
+	fb.file, err = os.OpenFile(fb.filename(), fb.fileFlags, 0600)
 	return err
+}
+
+func (fb *filebased) filename() string {
+	return filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence))
 }
 
 // WAL provides a simple write-ahead log backed by a single file on disk.
@@ -233,54 +237,73 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 }
 
 func (r *Reader) Read() ([]byte, error) {
-	// Read length
-	lenBuf := make([]byte, 4)
-	read := 0
-	length := 0
+top:
 	for {
-		read = 0
-
+		// Read length
+		lenBuf := make([]byte, 4)
+		read := 0
+		length := 0
 		for {
-			n, err := r.bufReader.Read(lenBuf[read:])
+			read = 0
+
+			for {
+				n, err := r.bufReader.Read(lenBuf[read:])
+				if err == io.EOF && n == 0 {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				read += n
+				r.position += int64(n)
+				if read == 4 {
+					length = int(encoding.Uint32(lenBuf))
+					break
+				}
+			}
+
+			if length > sentinel {
+				break
+			}
+
+			err := r.advance()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Read data
+		b := make([]byte, length)
+		read = 0
+		for {
+			n, err := r.bufReader.Read(b[read:])
 			if err == io.EOF && n == 0 {
+				files, err := ioutil.ReadDir(r.dir)
+				if err != nil {
+					return nil, fmt.Errorf("Unable to list existing log files: %v", err)
+				}
+				cutoff := fmt.Sprint(r.fileSequence)
+				for _, file := range files {
+					if file.Name() > cutoff {
+						log.Errorf("Out of data to read, and newer log files present, assuming WAL at %v corrupted. Advancing and continuing.", r.filename())
+						err := r.advance()
+						if err != nil {
+							return nil, err
+						}
+						continue top
+					}
+				}
+				// No newer log files, continue trying to read from this one
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 			read += n
 			r.position += int64(n)
-			if read == 4 {
-				length = int(encoding.Uint32(lenBuf))
+			if read == length {
 				break
 			}
 		}
 
-		if length > sentinel {
-			break
-		}
-
-		err := r.advance()
-		if err != nil {
-			return nil, err
-		}
+		return b, nil
 	}
-
-	// Read data
-	b := make([]byte, length)
-	read = 0
-	for {
-		n, err := r.bufReader.Read(b[read:])
-		if err == io.EOF && n == 0 {
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		read += n
-		r.position += int64(n)
-		if read == length {
-			break
-		}
-	}
-
-	return b, nil
 }
 
 func (r *Reader) Offset() Offset {
