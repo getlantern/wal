@@ -15,11 +15,16 @@ import (
 	"github.com/getlantern/golog"
 )
 
+const (
+	sentinel = 0
+)
+
 var (
 	log = golog.LoggerFor("wal")
 
 	maxSegmentSize = int64(10485760)
 	encoding       = binary.BigEndian
+	sentinelBytes  = make([]byte, 4) // same as 0
 )
 
 type filebased struct {
@@ -51,35 +56,27 @@ type WAL struct {
 }
 
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
-	wal := &WAL{filebased: filebased{dir: dir, fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY}}
-	// Append to latest file if available
-	files, err := ioutil.ReadDir(wal.dir)
+	// Append sentinel values to all existing files just in case
+	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to list existing log files: %v", err)
 	}
-
-	if len(files) > 0 {
-		// Files are sorted by name, so the last in the list is the latest
-		latestFile := files[len(files)-1]
-		if latestFile.Size() < maxSegmentSize {
-			wal.position = latestFile.Size()
-			wal.fileSequence, err = strconv.ParseInt(latestFile.Name(), 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("Unable to parse file sequence from filename %v: %v", latestFile.Name(), err)
-			}
-			err := wal.openFile()
-			if err != nil {
-				return nil, err
-			}
-			wal.bufWriter = bufio.NewWriter(wal.file)
+	for _, fileInfo := range files {
+		file, err := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), err)
+		}
+		defer file.Close()
+		_, err = file.Write(sentinelBytes)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), err)
 		}
 	}
 
-	if wal.file == nil {
-		err := wal.advance()
-		if err != nil {
-			return nil, err
-		}
+	wal := &WAL{filebased: filebased{dir: dir, fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY}}
+	err = wal.advance()
+	if err != nil {
+		return nil, err
 	}
 
 	if syncInterval <= 0 {
@@ -99,6 +96,10 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	for _, b := range bufs {
 		length += len(b)
 	}
+	if length == 0 {
+		return 0, nil
+	}
+
 	lenBuf := make([]byte, 4)
 	encoding.PutUint32(lenBuf, uint32(length))
 	n, err := wal.bufWriter.Write(lenBuf)
@@ -120,6 +121,15 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	wal.position += int64(n)
 	if wal.position >= maxSegmentSize {
+		// Write sentinel length to mark end of file
+		_, err = wal.bufWriter.Write(sentinelBytes)
+		if err != nil {
+			return 0, err
+		}
+		err = wal.bufWriter.Flush()
+		if err != nil {
+			return 0, err
+		}
 		err = wal.advance()
 		if err != nil {
 			return n, fmt.Errorf("Unable to advance to next file: %v", err)
@@ -228,21 +238,30 @@ func (r *Reader) Read() ([]byte, error) {
 	read := 0
 	length := 0
 	for {
-		n, err := r.bufReader.Read(lenBuf[read:])
-		if err == io.EOF && n == 0 {
-			time.Sleep(50 * time.Millisecond)
-			continue
+		read = 0
+
+		for {
+			n, err := r.bufReader.Read(lenBuf[read:])
+			if err == io.EOF && n == 0 {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			read += n
+			r.position += int64(n)
+			if read == 4 {
+				length = int(encoding.Uint32(lenBuf))
+				break
+			}
 		}
-		read += n
-		r.position += int64(n)
-		if read == 4 {
-			length = int(encoding.Uint32(lenBuf))
+
+		if length > sentinel {
 			break
 		}
-	}
 
-	if length == 0 {
-		return nil, nil
+		err := r.advance()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Read data
@@ -258,13 +277,6 @@ func (r *Reader) Read() ([]byte, error) {
 		r.position += int64(n)
 		if read == length {
 			break
-		}
-	}
-
-	if r.position >= maxSegmentSize {
-		err := r.advance()
-		if err != nil {
-			return nil, err
 		}
 	}
 

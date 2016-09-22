@@ -107,7 +107,7 @@ func TestWAL(t *testing.T) {
 	}
 
 	// Truncate as of known offset, should not delete any files
-	testTruncate(t, wal, r.Offset(), 1)
+	testTruncate(t, wal, r.Offset(), 2)
 
 	// Truncate as of now, which should remove old log segment
 	testTruncate(t, wal, newOffset(time.Now().UnixNano(), 0), 0)
