@@ -70,14 +70,14 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 		return nil, fmt.Errorf("Unable to list existing log files: %v", err)
 	}
 	for _, fileInfo := range files {
-		file, err := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), err)
+		file, sentinelErr := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
+		if sentinelErr != nil {
+			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
 		defer file.Close()
-		_, err = file.Write(sentinelBytes)
-		if err != nil {
-			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), err)
+		_, sentinelErr = file.Write(sentinelBytes)
+		if sentinelErr != nil {
+			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
 	}
 
