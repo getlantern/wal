@@ -249,9 +249,9 @@ func (r *Reader) Read() ([]byte, error) {
 	b := make([]byte, length)
 	read = 0
 	for {
-		n, err := r.bufReader.Read(b)
+		n, err := r.bufReader.Read(b[read:])
 		if err == io.EOF && n == 0 {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		read += n
