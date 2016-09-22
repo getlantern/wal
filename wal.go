@@ -293,24 +293,26 @@ func (r *Reader) open() error {
 }
 
 func (r *Reader) advance() error {
-	files, err := ioutil.ReadDir(r.dir)
-	if err != nil {
-		return fmt.Errorf("Unable to list existing log files: %v", err)
-	}
-
-	cutoff := fmt.Sprintf("%d", r.fileSequence)
-	for _, fileInfo := range files {
-		if fileInfo.Name() > cutoff {
-			// Files are sorted by name, if we've gotten past the cutoff, don't bother
-			// continuing
-			r.position = 0
-			r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
-			if err != nil {
-				return fmt.Errorf("Unable to parse file sequence from filename %v: %v", fileInfo.Name(), err)
-			}
-			return r.open()
+	for {
+		files, err := ioutil.ReadDir(r.dir)
+		if err != nil {
+			return fmt.Errorf("Unable to list existing log files: %v", err)
 		}
-	}
 
-	return fmt.Errorf("No file found past position %d", r.position)
+		cutoff := fmt.Sprintf("%d", r.fileSequence)
+		for _, fileInfo := range files {
+			if fileInfo.Name() > cutoff {
+				// Files are sorted by name, if we've gotten past the cutoff, don't bother
+				// continuing
+				r.position = 0
+				r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
+				if err != nil {
+					return fmt.Errorf("Unable to parse file sequence from filename %v: %v", fileInfo.Name(), err)
+				}
+				return r.open()
+			}
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
 }
