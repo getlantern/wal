@@ -230,7 +230,7 @@ func (r *Reader) Read() ([]byte, error) {
 	for {
 		n, err := r.bufReader.Read(lenBuf[read:])
 		if err == io.EOF && n == 0 {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		read += n
