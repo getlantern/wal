@@ -51,7 +51,8 @@ func (fb *filebased) filename() string {
 	return filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence))
 }
 
-// WAL provides a simple write-ahead log backed by a single file on disk.
+// WAL provides a simple write-ahead log backed by a single file on disk. It is
+// safe to write to a single WAL from multiple goroutines.
 type WAL struct {
 	filebased
 	syncImmediate bool
@@ -59,6 +60,9 @@ type WAL struct {
 	mx            sync.Mutex
 }
 
+// Open opens a WAL in the given directory. It will be force synced to disk
+// every syncInterval. If syncInterval is 0, it will force sync on every write
+// to the WAL.
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	// Append sentinel values to all existing files just in case
 	files, err := ioutil.ReadDir(dir)
@@ -92,6 +96,7 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	return wal, nil
 }
 
+// Write atomically writes one or more buffers to the WAL.
 func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	wal.mx.Lock()
 	defer wal.mx.Unlock()
@@ -143,6 +148,7 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	return n, nil
 }
 
+// TruncateBefore removes all data prior to the given offset from disk.
 func (wal *WAL) TruncateBefore(o Offset) error {
 	files, err := ioutil.ReadDir(wal.dir)
 	if err != nil {
@@ -165,6 +171,7 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 	return nil
 }
 
+// Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
 	flushErr := wal.bufWriter.Flush()
 	closeErr := wal.file.Close()
@@ -205,11 +212,16 @@ func (wal *WAL) doSync() {
 	}
 }
 
+// Reader allows reading from a WAL. It is NOT safe to read from a single Reader
+// from multiple goroutines.
 type Reader struct {
 	filebased
 	bufReader *bufio.Reader
 }
 
+// NewReader constructs a new Reader for reading from this WAL starting at the
+// given offset. The returned Reader is NOT safe for use from multiple
+// goroutines.
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}}
 	files, err := ioutil.ReadDir(wal.dir)
@@ -236,6 +248,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 	return r, nil
 }
 
+// Read reads the next chunk from the WAL, blocking until one is available.
 func (r *Reader) Read() ([]byte, error) {
 top:
 	for {
@@ -306,10 +319,13 @@ top:
 	}
 }
 
+// Offset returns the furthest Offset read by this Reader. It is NOT safe to
+// call this concurrently with Read().
 func (r *Reader) Offset() Offset {
 	return newOffset(r.fileSequence, r.position)
 }
 
+// Close closes the Reader.
 func (r *Reader) Close() error {
 	return r.file.Close()
 }
