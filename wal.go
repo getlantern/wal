@@ -233,6 +233,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		cutoff := fmt.Sprint(offset.FileSequence())
 		for _, fileInfo := range files {
 			if fileInfo.Name() >= cutoff {
+				log.Debugf("Using existing WAL file at %v", fileInfo.Name())
 				// Found exist or more recent WAL file
 				r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
 				if err != nil {
@@ -247,7 +248,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 				}
 				openErr := r.open()
 				if openErr != nil {
-					return nil, openErr
+					return nil, fmt.Errorf("Unable to open existing log file at %v: %v", fileInfo.Name(), openErr)
 				}
 				break
 			}
@@ -258,7 +259,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		// Didn't find WAL file, advance
 		err := r.advance()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("Unable to advance initially: %v", err)
 		}
 	}
 	return r, nil
