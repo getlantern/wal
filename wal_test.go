@@ -72,6 +72,11 @@ func TestWAL(t *testing.T) {
 	}
 	defer wal.Close()
 
+	r2, err := wal.NewReader(r.Offset())
+	if !assert.NoError(t, err) {
+		return
+	}
+
 	if !testReadWrite("3") {
 		return
 	}
@@ -83,13 +88,22 @@ func TestWAL(t *testing.T) {
 	defer r.Close()
 
 	for _, expected := range []string{"1", "2", "3"} {
-		b, err := r.Read()
-		if !assert.NoError(t, err) {
+		b, readErr := r.Read()
+		if !assert.NoError(t, readErr) {
 			return
 		}
 		if !assert.Equal(t, expected, string(b)) {
 			return
 		}
+	}
+
+	// Reader opened at prior offset should only get "3"
+	b, readErr := r2.Read()
+	if !assert.NoError(t, readErr) {
+		return
+	}
+	if !assert.Equal(t, "3", string(b)) {
+		return
 	}
 
 	// Truncate as of known offset, should not delete any files

@@ -2,6 +2,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 const (
@@ -25,4 +26,8 @@ func (o Offset) FileSequence() int64 {
 
 func (o Offset) Position() int64 {
 	return int64(binary.BigEndian.Uint64(o[8:]))
+}
+
+func (o Offset) String() string {
+	return fmt.Sprintf("%d:%d", o.FileSequence(), o.Position())
 }

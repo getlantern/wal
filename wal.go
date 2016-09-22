@@ -209,9 +209,18 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		return nil, fmt.Errorf("No log files, can't open reader")
 	}
 
-	err = r.advance()
-	if err != nil {
-		return nil, err
+	if offset != nil {
+		r.fileSequence = offset.FileSequence()
+		r.position = offset.Position()
+		openErr := r.doOpen()
+		if openErr != nil {
+			return nil, openErr
+		}
+	} else {
+		err = r.advance()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return r, nil
 }
@@ -289,18 +298,22 @@ func (r *Reader) advance() error {
 			if err != nil {
 				return fmt.Errorf("Unable to parse file sequence from filename %v: %v", fileInfo.Name(), err)
 			}
-			err := r.openFile()
-			if err != nil {
-				return err
-			}
-			_, err = r.file.Seek(r.position, 0)
-			if err != nil {
-				return err
-			}
-			r.bufReader = bufio.NewReader(r.file)
-			return nil
+			return r.doOpen()
 		}
 	}
 
 	return fmt.Errorf("No file found past position %d", r.position)
+}
+
+func (r *Reader) doOpen() error {
+	err := r.openFile()
+	if err != nil {
+		return err
+	}
+	_, err = r.file.Seek(r.position, 0)
+	if err != nil {
+		return err
+	}
+	r.bufReader = bufio.NewReader(r.file)
+	return nil
 }
