@@ -91,21 +91,27 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	return wal, nil
 }
 
-func (wal *WAL) Write(b []byte) (int, error) {
+func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	wal.mx.Lock()
 	defer wal.mx.Unlock()
 
+	length := 0
+	for _, b := range bufs {
+		length += len(b)
+	}
 	lenBuf := make([]byte, 4)
-	encoding.PutUint32(lenBuf, uint32(len(b)))
+	encoding.PutUint32(lenBuf, uint32(length))
 	n, err := wal.bufWriter.Write(lenBuf)
 	wal.position += int64(n)
 	if err != nil {
 		return 0, err
 	}
 
-	n, err = wal.bufWriter.Write(b)
-	if err != nil {
-		return 0, err
+	for _, b := range bufs {
+		n, err = wal.bufWriter.Write(b)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	if wal.syncImmediate {
