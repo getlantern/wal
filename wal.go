@@ -224,23 +224,39 @@ type Reader struct {
 // goroutines.
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}}
-	files, err := ioutil.ReadDir(wal.dir)
-	if err != nil {
-		return nil, fmt.Errorf("Unable to list existing log files: %v", err)
-	}
-	if len(files) == 0 {
-		return nil, fmt.Errorf("No log files, can't open reader")
+	if offset != nil {
+		files, err := ioutil.ReadDir(wal.dir)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to list existing log files: %v", err)
+		}
+
+		cutoff := fmt.Sprint(offset.FileSequence())
+		for _, fileInfo := range files {
+			if fileInfo.Name() >= cutoff {
+				// Found exist or more recent WAL file
+				r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
+				if err != nil {
+					return nil, fmt.Errorf("Unable to parse WAL file name %v: %v", fileInfo.Name(), err)
+				}
+				if r.fileSequence == offset.FileSequence() {
+					// Exact match, start at right position
+					r.position = offset.Position()
+				} else {
+					// Newer WAL file, start at beginning
+					r.position = 0
+				}
+				openErr := r.open()
+				if openErr != nil {
+					return nil, openErr
+				}
+				break
+			}
+		}
 	}
 
-	if offset != nil {
-		r.fileSequence = offset.FileSequence()
-		r.position = offset.Position()
-		openErr := r.open()
-		if openErr != nil {
-			return nil, openErr
-		}
-	} else {
-		err = r.advance()
+	if r.file == nil {
+		// Didn't find WAL file, advance
+		err := r.advance()
 		if err != nil {
 			return nil, err
 		}
