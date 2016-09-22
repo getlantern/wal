@@ -27,7 +27,7 @@ type filebased struct {
 	file         *os.File
 	fileSequence int64
 	position     int64
-	open         func(filename string, position int64) (*os.File, error)
+	fileFlags    int
 }
 
 func (fb *filebased) openFile() error {
@@ -38,7 +38,7 @@ func (fb *filebased) openFile() error {
 			log.Errorf("Unable to close existing file %v: %v", fb.file.Name(), err)
 		}
 	}
-	fb.file, err = fb.open(filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence)), fb.position)
+	fb.file, err = os.OpenFile(filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence)), fb.fileFlags, 0600)
 	return err
 }
 
@@ -51,9 +51,7 @@ type WAL struct {
 }
 
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
-	wal := &WAL{filebased: filebased{dir: dir, open: func(filename string, position int64) (*os.File, error) {
-		return os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-	}}}
+	wal := &WAL{filebased: filebased{dir: dir, fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY}}
 	// Append to latest file if available
 	files, err := ioutil.ReadDir(wal.dir)
 	if err != nil {
@@ -193,14 +191,7 @@ type Reader struct {
 }
 
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
-	r := &Reader{filebased: filebased{dir: wal.dir, open: func(filename string, position int64) (*os.File, error) {
-		file, err := os.OpenFile(filename, os.O_RDONLY, 0600)
-		if err == nil {
-			_, err = file.Seek(position, 0)
-		}
-		return file, err
-	}}}
-
+	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}}
 	files, err := ioutil.ReadDir(wal.dir)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to list existing log files: %v", err)
@@ -212,7 +203,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 	if offset != nil {
 		r.fileSequence = offset.FileSequence()
 		r.position = offset.Position()
-		openErr := r.doOpen()
+		openErr := r.open()
 		if openErr != nil {
 			return nil, openErr
 		}
@@ -282,6 +273,19 @@ func (r *Reader) Close() error {
 	return r.file.Close()
 }
 
+func (r *Reader) open() error {
+	err := r.openFile()
+	if err != nil {
+		return err
+	}
+	_, err = r.file.Seek(r.position, 0)
+	if err != nil {
+		return err
+	}
+	r.bufReader = bufio.NewReader(r.file)
+	return nil
+}
+
 func (r *Reader) advance() error {
 	files, err := ioutil.ReadDir(r.dir)
 	if err != nil {
@@ -298,22 +302,9 @@ func (r *Reader) advance() error {
 			if err != nil {
 				return fmt.Errorf("Unable to parse file sequence from filename %v: %v", fileInfo.Name(), err)
 			}
-			return r.doOpen()
+			return r.open()
 		}
 	}
 
 	return fmt.Errorf("No file found past position %d", r.position)
-}
-
-func (r *Reader) doOpen() error {
-	err := r.openFile()
-	if err != nil {
-		return err
-	}
-	_, err = r.file.Seek(r.position, 0)
-	if err != nil {
-		return err
-	}
-	r.bufReader = bufio.NewReader(r.file)
-	return nil
 }
