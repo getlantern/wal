@@ -107,14 +107,15 @@ func TestWAL(t *testing.T) {
 	}
 
 	// Truncate as of known offset, should not delete any files
-	testTruncate(t, wal, r.Offset(), 2)
+	truncateErr := wal.TruncateBefore(r.Offset())
+	testTruncate(t, wal, truncateErr, 2)
 
 	// Truncate as of now, which should remove old log segment
-	testTruncate(t, wal, newOffset(time.Now().UnixNano(), 0), 0)
+	truncateErr = wal.TruncateBeforeTime(time.Now())
+	testTruncate(t, wal, truncateErr, 0)
 }
 
-func testTruncate(t *testing.T, wal *WAL, offset Offset, expectedSegments int) {
-	err := wal.TruncateBefore(offset)
+func testTruncate(t *testing.T, wal *WAL, err error, expectedSegments int) {
 	if assert.NoError(t, err, "Should be able to truncate") {
 		segments, err := ioutil.ReadDir(wal.dir)
 		if assert.NoError(t, err, "Should be able to list segments") {

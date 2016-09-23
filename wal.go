@@ -171,6 +171,11 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 	return nil
 }
 
+// TruncateBeforeTime truncates WAL data prior to the given timestamp.
+func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
+	return wal.TruncateBefore(newOffset(ts.UnixNano(), 0))
+}
+
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
 	flushErr := wal.bufWriter.Flush()
@@ -233,7 +238,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		cutoff := fmt.Sprint(offset.FileSequence())
 		for _, fileInfo := range files {
 			if fileInfo.Name() >= cutoff {
-				log.Debugf("Using existing WAL file at %v", fileInfo.Name())
+				log.Debugf("Will read from existing WAL file at %v", fileInfo.Name())
 				// Found exist or more recent WAL file
 				r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
 				if err != nil {
