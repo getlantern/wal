@@ -156,16 +156,17 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 	}
 
 	cutoff := fmt.Sprintf("%d", o.FileSequence())
-	for _, file := range files {
-		if file.Name() >= cutoff {
-			// Files are sorted by name, if we've gotten past the cutoff, don't bother
-			// continuing
+	for i, file := range files {
+		if i == len(files)-1 || file.Name() >= cutoff {
+			// Files are sorted by name, if we've gotten past the cutoff or
+			// encountered the last (active) file, don't bother continuing.
 			break
 		}
 		rmErr := os.Remove(filepath.Join(wal.dir, file.Name()))
 		if rmErr != nil {
 			return rmErr
 		}
+		log.Debugf("Removed WAL file %v", filepath.Join(wal.dir, file.Name()))
 	}
 
 	return nil

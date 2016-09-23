@@ -106,13 +106,18 @@ func TestWAL(t *testing.T) {
 		return
 	}
 
+	_, err = wal.Write([]byte("data to force new WAL"))
+	if !assert.NoError(t, err) {
+		return
+	}
+
 	// Truncate as of known offset, should not delete any files
 	truncateErr := wal.TruncateBefore(r.Offset())
-	testTruncate(t, wal, truncateErr, 2)
+	testTruncate(t, wal, truncateErr, 3)
 
 	// Truncate as of now, which should remove old log segment
 	truncateErr = wal.TruncateBeforeTime(time.Now())
-	testTruncate(t, wal, truncateErr, 0)
+	testTruncate(t, wal, truncateErr, 1)
 }
 
 func testTruncate(t *testing.T, wal *WAL, err error, expectedSegments int) {
