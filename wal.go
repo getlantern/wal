@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/getlantern/golog"
+	"github.com/golang/snappy"
 )
 
 const (
@@ -57,6 +58,7 @@ type WAL struct {
 	filebased
 	syncImmediate bool
 	bufWriter     *bufio.Writer
+	snappyWriter  *snappy.Writer
 	mx            sync.Mutex
 }
 
@@ -64,21 +66,14 @@ type WAL struct {
 // every syncInterval. If syncInterval is 0, it will force sync on every write
 // to the WAL.
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
-	// Append sentinel values to all existing files just in case
-	files, err := ioutil.ReadDir(dir)
+	err := convertLegacyFormat(dir)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to list existing log files: %v", err)
+		return nil, err
 	}
-	for _, fileInfo := range files {
-		file, sentinelErr := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
-		if sentinelErr != nil {
-			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
-		}
-		defer file.Close()
-		_, sentinelErr = file.Write(sentinelBytes)
-		if sentinelErr != nil {
-			return nil, fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
-		}
+
+	err = appendSentinels(dir)
+	if err != nil {
+		return nil, err
 	}
 
 	wal := &WAL{filebased: filebased{dir: dir, fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY}}
@@ -96,6 +91,79 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	return wal, nil
 }
 
+func convertLegacyFormat(dir string) error {
+	// Compress existing files with snappy if necessary
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list existing log files: %v", err)
+	}
+
+	for _, fileInfo := range files {
+		if fileInfo.Name()[0] != '0' {
+			// Filename isn't left-padded, assuming old format
+			log.Debugf("Converting legacy WAL file %v", fileInfo.Name())
+			in, err := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_RDONLY, 0600)
+			if err != nil {
+				return fmt.Errorf("Unable to open legacy file for conversion: %v", err)
+			}
+			defer in.Close()
+			bufIn := bufio.NewReader(in)
+			out, err := os.OpenFile(filepath.Join(dir, sequenceToFilename(filenameToSequence(fileInfo.Name())/1000)), os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				return fmt.Errorf("Unable to open new file for legacy conversion: %v", err)
+			}
+			defer out.Close()
+			bufOut := bufio.NewWriter(out)
+			snappyOut := snappy.NewWriter(bufOut)
+			_, err = io.Copy(snappyOut, bufIn)
+			if err != nil {
+				return fmt.Errorf("Unable to convert legacy file: %v", err)
+			}
+			err = snappyOut.Close()
+			if err != nil {
+				return fmt.Errorf("Unable to close snappy on conversion: %v", err)
+			}
+			err = bufOut.Flush()
+			if err != nil {
+				return fmt.Errorf("Unable to flush buffer on conversion: %v", err)
+			}
+			err = out.Close()
+			if err != nil {
+				return fmt.Errorf("Unable to close converted file: %v", err)
+			}
+			err = os.Remove(in.Name())
+			if err != nil {
+				log.Errorf("Unable to remove old file '%v': %v", in.Name(), err)
+			}
+		}
+	}
+	return nil
+}
+
+func appendSentinels(dir string) error {
+	// Append sentinel values to all existing files just in case
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list existing log files: %v", err)
+	}
+
+	for _, fileInfo := range files {
+		file, sentinelErr := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
+		if sentinelErr != nil {
+			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
+		}
+		defer file.Close()
+		snappyWriter := snappy.NewWriter(file)
+		defer snappyWriter.Close()
+		_, sentinelErr = snappyWriter.Write(sentinelBytes)
+		if sentinelErr != nil {
+			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
+		}
+	}
+
+	return nil
+}
+
 // Write atomically writes one or more buffers to the WAL.
 func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	wal.mx.Lock()
@@ -111,14 +179,14 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	lenBuf := make([]byte, 4)
 	encoding.PutUint32(lenBuf, uint32(length))
-	n, err := wal.bufWriter.Write(lenBuf)
+	n, err := wal.snappyWriter.Write(lenBuf)
 	wal.position += int64(n)
 	if err != nil {
 		return 0, err
 	}
 
 	for _, b := range bufs {
-		n, err = wal.bufWriter.Write(b)
+		n, err = wal.snappyWriter.Write(b)
 		if err != nil {
 			return 0, err
 		}
@@ -131,7 +199,11 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	wal.position += int64(n)
 	if wal.position >= maxSegmentSize {
 		// Write sentinel length to mark end of file
-		_, err = wal.bufWriter.Write(sentinelBytes)
+		_, err = wal.snappyWriter.Write(sentinelBytes)
+		if err != nil {
+			return 0, err
+		}
+		err = wal.snappyWriter.Close()
 		if err != nil {
 			return 0, err
 		}
@@ -179,8 +251,12 @@ func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
+	snappyErr := wal.snappyWriter.Close()
 	flushErr := wal.bufWriter.Flush()
 	closeErr := wal.file.Close()
+	if snappyErr != nil {
+		return snappyErr
+	}
 	if flushErr != nil {
 		return flushErr
 	}
@@ -193,6 +269,7 @@ func (wal *WAL) advance() error {
 	err := wal.openFile()
 	if err == nil {
 		wal.bufWriter = bufio.NewWriter(wal.file)
+		wal.snappyWriter = snappy.NewWriter(wal.bufWriter)
 	}
 	return err
 }
@@ -207,14 +284,19 @@ func (wal *WAL) sync(syncInterval time.Duration) {
 }
 
 func (wal *WAL) doSync() {
-	err := wal.bufWriter.Flush()
+	err := wal.snappyWriter.Flush()
 	if err != nil {
 		log.Errorf("Unable to flush wal: %v", err)
-	} else {
-		err = wal.file.Sync()
-		if err != nil {
-			log.Errorf("Unable to sync wal: %v", err)
-		}
+		return
+	}
+	err = wal.bufWriter.Flush()
+	if err != nil {
+		log.Errorf("Unable to flush wal: %v", err)
+		return
+	}
+	err = wal.file.Sync()
+	if err != nil {
+		log.Errorf("Unable to sync wal: %v", err)
 	}
 }
 
@@ -222,7 +304,7 @@ func (wal *WAL) doSync() {
 // from multiple goroutines.
 type Reader struct {
 	filebased
-	bufReader *bufio.Reader
+	reader *snappy.Reader
 }
 
 // NewReader constructs a new Reader for reading from this WAL starting at the
@@ -231,6 +313,12 @@ type Reader struct {
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}}
 	if offset != nil {
+		offsetString := sequenceToFilename(offset.FileSequence())
+		if offsetString[0] != '0' {
+			log.Debugf("Converting legacy offset")
+			offset = newOffset(offset.FileSequence()/1000, offset.Position())
+		}
+
 		files, err := ioutil.ReadDir(wal.dir)
 		if err != nil {
 			return nil, fmt.Errorf("Unable to list existing log files: %v", err)
@@ -239,7 +327,6 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		cutoff := sequenceToFilename(offset.FileSequence())
 		for _, fileInfo := range files {
 			if fileInfo.Name() >= cutoff {
-				log.Debugf("Will read from existing WAL file at %v", fileInfo.Name())
 				// Found exist or more recent WAL file
 				r.fileSequence = filenameToSequence(fileInfo.Name())
 				if r.fileSequence == offset.FileSequence() {
@@ -280,7 +367,7 @@ top:
 			read = 0
 
 			for {
-				n, err := r.bufReader.Read(lenBuf[read:])
+				n, err := r.reader.Read(lenBuf[read:])
 				if err == io.EOF && n == 0 {
 					time.Sleep(50 * time.Millisecond)
 					continue
@@ -307,7 +394,7 @@ top:
 		b := make([]byte, length)
 		read = 0
 		for {
-			n, err := r.bufReader.Read(b[read:])
+			n, err := r.reader.Read(b[read:])
 			if err == io.EOF && n == 0 {
 				files, err := ioutil.ReadDir(r.dir)
 				if err != nil {
@@ -355,11 +442,17 @@ func (r *Reader) open() error {
 	if err != nil {
 		return err
 	}
-	_, err = r.file.Seek(r.position, 0)
-	if err != nil {
-		return err
+	bufReader := bufio.NewReader(r.file)
+	r.reader = snappy.NewReader(bufReader)
+	if r.position > 0 {
+		// Read to the correct offset
+		// Note - we cannot just seek on the file because the data is compressed and
+		// the recorded position does not correspond to a file offset.
+		_, seekErr := io.CopyN(ioutil.Discard, r.reader, r.position)
+		if seekErr != nil {
+			return seekErr
+		}
 	}
-	r.bufReader = bufio.NewReader(r.file)
 	return nil
 }
 

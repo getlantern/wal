@@ -83,11 +83,13 @@ func TestWAL(t *testing.T) {
 	if !assert.NoError(t, err) {
 		return
 	}
+	defer r2.Close()
 
 	if !testReadWrite("3") {
 		return
 	}
 
+	// Read the full WAL again
 	r, err = wal.NewReader(nil)
 	if !assert.NoError(t, err) {
 		return
