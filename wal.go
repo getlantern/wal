@@ -184,13 +184,13 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		wal.position += int64(n)
 	}
 
 	if wal.syncImmediate {
 		wal.doSync()
 	}
 
-	wal.position += int64(n)
 	if wal.position >= maxSegmentSize {
 		// Write sentinel length to mark end of file
 		_, err = wal.writer.Write(sentinelBytes)
