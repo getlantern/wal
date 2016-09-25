@@ -57,8 +57,7 @@ func (fb *filebased) filename() string {
 type WAL struct {
 	filebased
 	syncImmediate bool
-	bufWriter     *bufio.Writer
-	snappyWriter  *snappy.Writer
+	writer        *snappy.Writer
 	mx            sync.Mutex
 }
 
@@ -108,13 +107,12 @@ func convertLegacyFormat(dir string) error {
 			}
 			defer in.Close()
 			bufIn := bufio.NewReader(in)
-			out, err := os.OpenFile(filepath.Join(dir, sequenceToFilename(filenameToSequence(fileInfo.Name())/1000)), os.O_APPEND|os.O_WRONLY, 0600)
+			out, err := os.OpenFile(filepath.Join(dir, sequenceToFilename(filenameToSequence(fileInfo.Name())/1000)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 			if err != nil {
 				return fmt.Errorf("Unable to open new file for legacy conversion: %v", err)
 			}
 			defer out.Close()
-			bufOut := bufio.NewWriter(out)
-			snappyOut := snappy.NewWriter(bufOut)
+			snappyOut := snappy.NewBufferedWriter(out)
 			_, err = io.Copy(snappyOut, bufIn)
 			if err != nil {
 				return fmt.Errorf("Unable to convert legacy file: %v", err)
@@ -122,10 +120,6 @@ func convertLegacyFormat(dir string) error {
 			err = snappyOut.Close()
 			if err != nil {
 				return fmt.Errorf("Unable to close snappy on conversion: %v", err)
-			}
-			err = bufOut.Flush()
-			if err != nil {
-				return fmt.Errorf("Unable to flush buffer on conversion: %v", err)
 			}
 			err = out.Close()
 			if err != nil {
@@ -153,9 +147,9 @@ func appendSentinels(dir string) error {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
 		defer file.Close()
-		snappyWriter := snappy.NewWriter(file)
-		defer snappyWriter.Close()
-		_, sentinelErr = snappyWriter.Write(sentinelBytes)
+		writer := snappy.NewWriter(file)
+		defer writer.Close()
+		_, sentinelErr = writer.Write(sentinelBytes)
 		if sentinelErr != nil {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
@@ -179,14 +173,14 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	lenBuf := make([]byte, 4)
 	encoding.PutUint32(lenBuf, uint32(length))
-	n, err := wal.snappyWriter.Write(lenBuf)
+	n, err := wal.writer.Write(lenBuf)
 	wal.position += int64(n)
 	if err != nil {
 		return 0, err
 	}
 
 	for _, b := range bufs {
-		n, err = wal.snappyWriter.Write(b)
+		n, err = wal.writer.Write(b)
 		if err != nil {
 			return 0, err
 		}
@@ -199,15 +193,11 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	wal.position += int64(n)
 	if wal.position >= maxSegmentSize {
 		// Write sentinel length to mark end of file
-		_, err = wal.snappyWriter.Write(sentinelBytes)
+		_, err = wal.writer.Write(sentinelBytes)
 		if err != nil {
 			return 0, err
 		}
-		err = wal.snappyWriter.Close()
-		if err != nil {
-			return 0, err
-		}
-		err = wal.bufWriter.Flush()
+		err = wal.writer.Close()
 		if err != nil {
 			return 0, err
 		}
@@ -251,14 +241,10 @@ func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
-	snappyErr := wal.snappyWriter.Close()
-	flushErr := wal.bufWriter.Flush()
+	snappyErr := wal.writer.Close()
 	closeErr := wal.file.Close()
 	if snappyErr != nil {
 		return snappyErr
-	}
-	if flushErr != nil {
-		return flushErr
 	}
 	return closeErr
 }
@@ -268,8 +254,7 @@ func (wal *WAL) advance() error {
 	wal.position = 0
 	err := wal.openFile()
 	if err == nil {
-		wal.bufWriter = bufio.NewWriter(wal.file)
-		wal.snappyWriter = snappy.NewWriter(wal.bufWriter)
+		wal.writer = snappy.NewBufferedWriter(wal.file)
 	}
 	return err
 }
@@ -284,12 +269,7 @@ func (wal *WAL) sync(syncInterval time.Duration) {
 }
 
 func (wal *WAL) doSync() {
-	err := wal.snappyWriter.Flush()
-	if err != nil {
-		log.Errorf("Unable to flush wal: %v", err)
-		return
-	}
-	err = wal.bufWriter.Flush()
+	err := wal.writer.Flush()
 	if err != nil {
 		log.Errorf("Unable to flush wal: %v", err)
 		return
