@@ -48,7 +48,7 @@ func (fb *filebased) openFile() error {
 }
 
 func (fb *filebased) filename() string {
-	return filepath.Join(fb.dir, fmt.Sprintf("%d", fb.fileSequence))
+	return filepath.Join(fb.dir, sequenceToFilename(fb.fileSequence))
 }
 
 // WAL provides a simple write-ahead log backed by a single file on disk. It is
@@ -155,7 +155,7 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 		return fmt.Errorf("Unable to list log files to delete: %v", err)
 	}
 
-	cutoff := fmt.Sprintf("%d", o.FileSequence())
+	cutoff := sequenceToFilename(o.FileSequence())
 	for i, file := range files {
 		if i == len(files)-1 || file.Name() >= cutoff {
 			// Files are sorted by name, if we've gotten past the cutoff or
@@ -174,7 +174,7 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 
 // TruncateBeforeTime truncates WAL data prior to the given timestamp.
 func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
-	return wal.TruncateBefore(newOffset(ts.UnixNano(), 0))
+	return wal.TruncateBefore(newOffset(tsToFileSequence(ts), 0))
 }
 
 // Close closes the wal, including flushing any unsaved writes.
@@ -188,7 +188,7 @@ func (wal *WAL) Close() error {
 }
 
 func (wal *WAL) advance() error {
-	wal.fileSequence = time.Now().UnixNano()
+	wal.fileSequence = newFileSequence()
 	wal.position = 0
 	err := wal.openFile()
 	if err == nil {
@@ -236,15 +236,12 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 			return nil, fmt.Errorf("Unable to list existing log files: %v", err)
 		}
 
-		cutoff := fmt.Sprint(offset.FileSequence())
+		cutoff := sequenceToFilename(offset.FileSequence())
 		for _, fileInfo := range files {
 			if fileInfo.Name() >= cutoff {
 				log.Debugf("Will read from existing WAL file at %v", fileInfo.Name())
 				// Found exist or more recent WAL file
-				r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to parse WAL file name %v: %v", fileInfo.Name(), err)
-				}
+				r.fileSequence = filenameToSequence(fileInfo.Name())
 				if r.fileSequence == offset.FileSequence() {
 					// Exact match, start at right position
 					r.position = offset.Position()
@@ -316,7 +313,7 @@ top:
 				if err != nil {
 					return nil, fmt.Errorf("Unable to list existing log files: %v", err)
 				}
-				cutoff := fmt.Sprint(r.fileSequence)
+				cutoff := sequenceToFilename(r.fileSequence)
 				for _, file := range files {
 					if file.Name() > cutoff {
 						log.Errorf("Out of data to read, and newer log files present, assuming WAL at %v corrupted. Advancing and continuing.", r.filename())
@@ -373,20 +370,39 @@ func (r *Reader) advance() error {
 			return fmt.Errorf("Unable to list existing log files: %v", err)
 		}
 
-		cutoff := fmt.Sprintf("%d", r.fileSequence)
+		cutoff := sequenceToFilename(r.fileSequence)
 		for _, fileInfo := range files {
 			if fileInfo.Name() > cutoff {
 				// Files are sorted by name, if we've gotten past the cutoff, don't bother
 				// continuing
 				r.position = 0
-				r.fileSequence, err = strconv.ParseInt(fileInfo.Name(), 10, 64)
-				if err != nil {
-					return fmt.Errorf("Unable to parse file sequence from filename %v: %v", fileInfo.Name(), err)
-				}
+				r.fileSequence = filenameToSequence(fileInfo.Name())
 				return r.open()
 			}
 		}
 
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func newFileSequence() int64 {
+	return tsToFileSequence(time.Now())
+}
+
+func tsToFileSequence(ts time.Time) int64 {
+	return ts.UnixNano() / 1000
+}
+
+func sequenceToFilename(seq int64) string {
+	return fmt.Sprintf("%019d", seq)
+}
+
+func filenameToSequence(filename string) int64 {
+	_, filePart := filepath.Split(filename)
+	seq, err := strconv.ParseInt(filePart, 10, 64)
+	if err != nil {
+		log.Errorf("Unparseable filename '%v': %v", filename, err)
+		return 0
+	}
+	return seq
 }

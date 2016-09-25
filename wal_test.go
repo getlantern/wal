@@ -3,11 +3,18 @@ package wal
 import (
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func TestFileNaming(t *testing.T) {
+	seq := newFileSequence()
+	filename := filepath.Join("folder", sequenceToFilename(seq))
+	assert.Equal(t, seq, filenameToSequence(filename))
+}
 
 func TestWAL(t *testing.T) {
 	origMaxSegmentSize := maxSegmentSize
