@@ -57,7 +57,7 @@ func (fb *filebased) filename() string {
 type WAL struct {
 	filebased
 	syncImmediate bool
-	writer        *snappy.Writer
+	snappyWriter  *snappy.Writer
 	mx            sync.Mutex
 }
 
@@ -147,9 +147,9 @@ func appendSentinels(dir string) error {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
 		defer file.Close()
-		writer := snappy.NewWriter(file)
-		defer writer.Close()
-		_, sentinelErr = writer.Write(sentinelBytes)
+		snappyWriter := snappy.NewBufferedWriter(file)
+		defer snappyWriter.Close()
+		_, sentinelErr = snappyWriter.Write(sentinelBytes)
 		if sentinelErr != nil {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
@@ -173,14 +173,14 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	lenBuf := make([]byte, 4)
 	encoding.PutUint32(lenBuf, uint32(length))
-	n, err := wal.writer.Write(lenBuf)
+	n, err := wal.snappyWriter.Write(lenBuf)
 	wal.position += int64(n)
 	if err != nil {
 		return 0, err
 	}
 
 	for _, b := range bufs {
-		n, err = wal.writer.Write(b)
+		n, err = wal.snappyWriter.Write(b)
 		if err != nil {
 			return 0, err
 		}
@@ -193,11 +193,11 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	if wal.position >= maxSegmentSize {
 		// Write sentinel length to mark end of file
-		_, err = wal.writer.Write(sentinelBytes)
+		_, err = wal.snappyWriter.Write(sentinelBytes)
 		if err != nil {
 			return 0, err
 		}
-		err = wal.writer.Close()
+		err = wal.snappyWriter.Close()
 		if err != nil {
 			return 0, err
 		}
@@ -241,7 +241,7 @@ func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
-	snappyErr := wal.writer.Close()
+	snappyErr := wal.snappyWriter.Close()
 	closeErr := wal.file.Close()
 	if snappyErr != nil {
 		return snappyErr
@@ -254,7 +254,7 @@ func (wal *WAL) advance() error {
 	wal.position = 0
 	err := wal.openFile()
 	if err == nil {
-		wal.writer = snappy.NewBufferedWriter(wal.file)
+		wal.snappyWriter = snappy.NewWriter(wal.file)
 	}
 	return err
 }
@@ -269,7 +269,7 @@ func (wal *WAL) sync(syncInterval time.Duration) {
 }
 
 func (wal *WAL) doSync() {
-	err := wal.writer.Flush()
+	err := wal.snappyWriter.Flush()
 	if err != nil {
 		log.Errorf("Unable to flush wal: %v", err)
 		return
@@ -422,8 +422,7 @@ func (r *Reader) open() error {
 	if err != nil {
 		return err
 	}
-	bufReader := bufio.NewReader(r.file)
-	r.reader = snappy.NewReader(bufReader)
+	r.reader = snappy.NewReader(r.file)
 	if r.position > 0 {
 		// Read to the correct offset
 		// Note - we cannot just seek on the file because the data is compressed and
