@@ -14,6 +14,8 @@ func TestFileNaming(t *testing.T) {
 	seq := newFileSequence()
 	filename := filepath.Join("folder", sequenceToFilename(seq))
 	assert.Equal(t, seq, filenameToSequence(filename))
+	filename = filename + ".gz"
+	assert.Equal(t, seq, filenameToSequence(filename))
 }
 
 func TestWAL(t *testing.T) {
@@ -86,6 +88,12 @@ func TestWAL(t *testing.T) {
 	defer r2.Close()
 
 	if !testReadWrite("3") {
+		return
+	}
+
+	// Compress item 1
+	err = wal.CompressBefore(r2.Offset())
+	if !assert.NoError(t, err) {
 		return
 	}
 

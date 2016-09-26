@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,15 +10,16 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/getlantern/golog"
-	"github.com/golang/snappy"
 )
 
 const (
-	sentinel = 0
+	sentinel          = 0
+	defaultFileBuffer = 65536
 )
 
 var (
@@ -31,6 +33,7 @@ var (
 type filebased struct {
 	dir          string
 	file         *os.File
+	compressed   bool
 	fileSequence int64
 	position     int64
 	fileFlags    int
@@ -44,7 +47,13 @@ func (fb *filebased) openFile() error {
 			log.Errorf("Unable to close existing file %v: %v", fb.file.Name(), err)
 		}
 	}
+	fb.compressed = false
 	fb.file, err = os.OpenFile(fb.filename(), fb.fileFlags, 0600)
+	if os.IsNotExist(err) {
+		// Try gzipped version
+		fb.compressed = true
+		fb.file, err = os.OpenFile(fb.filename()+".gz", fb.fileFlags, 0600)
+	}
 	return err
 }
 
@@ -57,7 +66,7 @@ func (fb *filebased) filename() string {
 type WAL struct {
 	filebased
 	syncImmediate bool
-	writer        *snappy.Writer
+	writer        *bufio.Writer
 	mx            sync.Mutex
 }
 
@@ -65,12 +74,7 @@ type WAL struct {
 // every syncInterval. If syncInterval is 0, it will force sync on every write
 // to the WAL.
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
-	err := convertLegacyFormat(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	err = appendSentinels(dir)
+	err := appendSentinels(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -90,50 +94,6 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	return wal, nil
 }
 
-func convertLegacyFormat(dir string) error {
-	// Compress existing files with snappy if necessary
-	files, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("Unable to list existing log files: %v", err)
-	}
-
-	for _, fileInfo := range files {
-		if fileInfo.Name()[0] != '0' {
-			// Filename isn't left-padded, assuming old format
-			log.Debugf("Converting legacy WAL file %v", fileInfo.Name())
-			in, err := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_RDONLY, 0600)
-			if err != nil {
-				return fmt.Errorf("Unable to open legacy file for conversion: %v", err)
-			}
-			defer in.Close()
-			bufIn := bufio.NewReader(in)
-			out, err := os.OpenFile(filepath.Join(dir, sequenceToFilename(filenameToSequence(fileInfo.Name())/1000)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-			if err != nil {
-				return fmt.Errorf("Unable to open new file for legacy conversion: %v", err)
-			}
-			defer out.Close()
-			snappyOut := snappy.NewBufferedWriter(out)
-			_, err = io.Copy(snappyOut, bufIn)
-			if err != nil {
-				return fmt.Errorf("Unable to convert legacy file: %v", err)
-			}
-			err = snappyOut.Close()
-			if err != nil {
-				return fmt.Errorf("Unable to close snappy on conversion: %v", err)
-			}
-			err = out.Close()
-			if err != nil {
-				return fmt.Errorf("Unable to close converted file: %v", err)
-			}
-			err = os.Remove(in.Name())
-			if err != nil {
-				log.Errorf("Unable to remove old file '%v': %v", in.Name(), err)
-			}
-		}
-	}
-	return nil
-}
-
 func appendSentinels(dir string) error {
 	// Append sentinel values to all existing files just in case
 	files, err := ioutil.ReadDir(dir)
@@ -147,8 +107,8 @@ func appendSentinels(dir string) error {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
 		defer file.Close()
-		writer := snappy.NewBufferedWriter(file)
-		defer writer.Close()
+		writer := bufio.NewWriterSize(file, defaultFileBuffer)
+		defer writer.Flush()
 		_, sentinelErr = writer.Write(sentinelBytes)
 		if sentinelErr != nil {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
@@ -197,7 +157,7 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		err = wal.writer.Close()
+		err = wal.writer.Flush()
 		if err != nil {
 			return 0, err
 		}
@@ -234,6 +194,11 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 	return nil
 }
 
+// TruncateBeforeTime truncates WAL data prior to the given timestamp.
+func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
+	return wal.TruncateBefore(newOffset(tsToFileSequence(ts), 0))
+}
+
 // CompressBefore compresses all data prior to the given offset on disk.
 func (wal *WAL) CompressBefore(o Offset) error {
 	files, err := ioutil.ReadDir(wal.dir)
@@ -248,24 +213,56 @@ func (wal *WAL) CompressBefore(o Offset) error {
 			// encountered the last (active) file, don't bother continuing.
 			break
 		}
-		rmErr := os.Remove(filepath.Join(wal.dir, file.Name()))
-		if rmErr != nil {
-			return rmErr
+		infile := filepath.Join(wal.dir, file.Name())
+		outfile := infile + ".gz"
+		if strings.HasSuffix(file.Name(), ".gz") {
+			// Already compressed
+			continue
 		}
-		log.Debugf("Removed WAL file %v", filepath.Join(wal.dir, file.Name()))
+		in, err := os.OpenFile(infile, os.O_RDONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("Unable to open input file %v for compression: %v", infile, err)
+		}
+		defer in.Close()
+		out, err := os.OpenFile(outfile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return fmt.Errorf("Unable to open outputfile %v to compress %v: %v", outfile, infile, err)
+		}
+		defer out.Close()
+		gzOut, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+		if err != nil {
+			return fmt.Errorf("Unable to open gzip output stream for %v: %v", outfile, err)
+		}
+		_, err = io.Copy(gzOut, bufio.NewReaderSize(in, defaultFileBuffer))
+		if err != nil {
+			return fmt.Errorf("Unable to compress %v: %v", infile, err)
+		}
+		err = gzOut.Close()
+		if err != nil {
+			return fmt.Errorf("Unable to finalize compression of %v: %v", infile, err)
+		}
+		err = out.Close()
+		if err != nil {
+			return fmt.Errorf("Unable to close compressed output %v: %v", outfile, err)
+		}
+		err = os.Remove(infile)
+		if err != nil {
+			return fmt.Errorf("Unable to remove uncompressed file %v: %v", infile, err)
+		}
+		log.Debugf("Compressed WAL file %v", infile)
 	}
 
 	return nil
 }
 
-// TruncateBeforeTime truncates WAL data prior to the given timestamp.
-func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
-	return wal.TruncateBefore(newOffset(tsToFileSequence(ts), 0))
+// CompressBeforeTime compresses all data prior to the given offset on disk.
+func (wal *WAL) CompressBeforeTime(ts time.Time) error {
+	return wal.CompressBefore(newOffset(tsToFileSequence(ts), 0))
 }
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
-	snappyErr := wal.writer.Close()
+	snappyErr := wal.writer.Flush()
 	closeErr := wal.file.Close()
 	if snappyErr != nil {
 		return snappyErr
@@ -278,7 +275,7 @@ func (wal *WAL) advance() error {
 	wal.position = 0
 	err := wal.openFile()
 	if err == nil {
-		wal.writer = snappy.NewWriter(wal.file)
+		wal.writer = bufio.NewWriterSize(wal.file, defaultFileBuffer)
 	}
 	return err
 }
@@ -308,7 +305,7 @@ func (wal *WAL) doSync() {
 // from multiple goroutines.
 type Reader struct {
 	filebased
-	reader *snappy.Reader
+	reader io.Reader
 }
 
 // NewReader constructs a new Reader for reading from this WAL starting at the
@@ -446,7 +443,13 @@ func (r *Reader) open() error {
 	if err != nil {
 		return err
 	}
-	r.reader = snappy.NewReader(r.file)
+	r.reader = bufio.NewReaderSize(r.file, defaultFileBuffer)
+	if r.compressed {
+		r.reader, err = gzip.NewReader(r.reader)
+		if err != nil {
+			return fmt.Errorf("Unable to open gzip reader on %v: %v", r.file.Name(), err)
+		}
+	}
 	if r.position > 0 {
 		// Read to the correct offset
 		// Note - we cannot just seek on the file because the data is compressed and
@@ -468,11 +471,16 @@ func (r *Reader) advance() error {
 
 		cutoff := sequenceToFilename(r.fileSequence)
 		for _, fileInfo := range files {
+			seq := filenameToSequence(fileInfo.Name())
+			if seq == r.fileSequence {
+				// Duplicate WAL segment (i.e. compressed vs uncompressed), ignore
+				continue
+			}
 			if fileInfo.Name() > cutoff {
 				// Files are sorted by name, if we've gotten past the cutoff, don't bother
 				// continuing
 				r.position = 0
-				r.fileSequence = filenameToSequence(fileInfo.Name())
+				r.fileSequence = seq
 				return r.open()
 			}
 		}
@@ -495,6 +503,7 @@ func sequenceToFilename(seq int64) string {
 
 func filenameToSequence(filename string) int64 {
 	_, filePart := filepath.Split(filename)
+	filePart = strings.TrimSuffix(filePart, ".gz")
 	seq, err := strconv.ParseInt(filePart, 10, 64)
 	if err != nil {
 		log.Errorf("Unparseable filename '%v': %v", filename, err)
