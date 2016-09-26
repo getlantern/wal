@@ -26,7 +26,7 @@ const (
 var (
 	log = golog.LoggerFor("wal")
 
-	maxSegmentSize = int64(10485760)
+	maxSegmentSize = int64(104857600)
 	encoding       = binary.BigEndian
 	sentinelBytes  = make([]byte, 4) // same as 0
 )
@@ -68,7 +68,7 @@ type WAL struct {
 	filebased
 	syncImmediate bool
 	writer        *bufio.Writer
-	mx            sync.Mutex
+	mx            sync.RWMutex
 }
 
 // Open opens a WAL in the given directory. It will be force synced to disk
@@ -264,10 +264,14 @@ func (wal *WAL) CompressBeforeTime(ts time.Time) error {
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
-	snappyErr := wal.writer.Flush()
+	flushErr := wal.writer.Flush()
+	syncErr := wal.file.Sync()
 	closeErr := wal.file.Close()
-	if snappyErr != nil {
-		return snappyErr
+	if flushErr != nil {
+		return flushErr
+	}
+	if syncErr != nil {
+		return syncErr
 	}
 	return closeErr
 }
@@ -303,10 +307,18 @@ func (wal *WAL) doSync() {
 	}
 }
 
+func (wal *WAL) hasMovedBeyond(fileSequence int64) bool {
+	wal.mx.RLock()
+	hasMovedBeyond := wal.fileSequence > fileSequence
+	wal.mx.RUnlock()
+	return hasMovedBeyond
+}
+
 // Reader allows reading from a WAL. It is NOT safe to read from a single Reader
 // from multiple goroutines.
 type Reader struct {
 	filebased
+	wal    *WAL
 	reader io.Reader
 }
 
@@ -314,7 +326,7 @@ type Reader struct {
 // given offset. The returned Reader is NOT safe for use from multiple
 // goroutines.
 func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
-	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}}
+	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}, wal: wal}
 	if offset != nil {
 		offsetString := sequenceToFilename(offset.FileSequence())
 		if offsetString[0] != '0' {
@@ -354,6 +366,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Unable to advance initially: %v", err)
 		}
+		log.Debugf("Replaying log starting at %v", r.file.Name())
 	}
 	return r, nil
 }
@@ -399,20 +412,13 @@ top:
 		for {
 			n, err := r.reader.Read(b[read:])
 			if err != nil && err.Error() == "EOF" && n == 0 {
-				files, err := ioutil.ReadDir(r.dir)
-				if err != nil {
-					return nil, fmt.Errorf("Unable to list existing log files: %v", err)
-				}
-				cutoff := sequenceToFilename(r.fileSequence)
-				for _, file := range files {
-					if file.Name() > cutoff {
-						log.Errorf("Out of data to read, and newer log files present, assuming WAL at %v corrupted. Advancing and continuing.", r.filename())
-						err := r.advance()
-						if err != nil {
-							return nil, err
-						}
-						continue top
+				if r.wal.hasMovedBeyond(r.fileSequence) {
+					log.Errorf("Out of data to read after reading %d, and WAL has moved beyond %d. Assuming WAL at %v corrupted. Advancing and continuing.", r.position, r.fileSequence, r.filename())
+					err := r.advance()
+					if err != nil {
+						return nil, err
 					}
+					continue top
 				}
 				// No newer log files, continue trying to read from this one
 				time.Sleep(50 * time.Millisecond)
