@@ -14,7 +14,7 @@ func TestFileNaming(t *testing.T) {
 	seq := newFileSequence()
 	filename := filepath.Join("folder", sequenceToFilename(seq))
 	assert.Equal(t, seq, filenameToSequence(filename))
-	filename = filename + ".gz"
+	filename = filename + compressedSuffix
 	assert.Equal(t, seq, filenameToSequence(filename))
 }
 

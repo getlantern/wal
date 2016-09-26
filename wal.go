@@ -2,7 +2,6 @@ package wal
 
 import (
 	"bufio"
-	"compress/gzip"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -15,11 +14,13 @@ import (
 	"time"
 
 	"github.com/getlantern/golog"
+	"github.com/golang/snappy"
 )
 
 const (
 	sentinel          = 0
 	defaultFileBuffer = 65536
+	compressedSuffix  = ".snappy"
 )
 
 var (
@@ -50,9 +51,9 @@ func (fb *filebased) openFile() error {
 	fb.compressed = false
 	fb.file, err = os.OpenFile(fb.filename(), fb.fileFlags, 0600)
 	if os.IsNotExist(err) {
-		// Try gzipped version
+		// Try compressed version
 		fb.compressed = true
-		fb.file, err = os.OpenFile(fb.filename()+".gz", fb.fileFlags, 0600)
+		fb.file, err = os.OpenFile(fb.filename()+compressedSuffix, fb.fileFlags, 0600)
 	}
 	return err
 }
@@ -214,8 +215,8 @@ func (wal *WAL) CompressBefore(o Offset) error {
 			break
 		}
 		infile := filepath.Join(wal.dir, file.Name())
-		outfile := infile + ".gz"
-		if strings.HasSuffix(file.Name(), ".gz") {
+		outfile := infile + compressedSuffix
+		if strings.HasSuffix(file.Name(), compressedSuffix) {
 			// Already compressed
 			continue
 		}
@@ -229,15 +230,12 @@ func (wal *WAL) CompressBefore(o Offset) error {
 			return fmt.Errorf("Unable to open outputfile %v to compress %v: %v", outfile, infile, err)
 		}
 		defer out.Close()
-		gzOut, err := gzip.NewWriterLevel(out, gzip.BestCompression)
-		if err != nil {
-			return fmt.Errorf("Unable to open gzip output stream for %v: %v", outfile, err)
-		}
-		_, err = io.Copy(gzOut, bufio.NewReaderSize(in, defaultFileBuffer))
+		compressedOut := snappy.NewWriter(out)
+		_, err = io.Copy(compressedOut, bufio.NewReaderSize(in, defaultFileBuffer))
 		if err != nil {
 			return fmt.Errorf("Unable to compress %v: %v", infile, err)
 		}
-		err = gzOut.Close()
+		err = compressedOut.Close()
 		if err != nil {
 			return fmt.Errorf("Unable to finalize compression of %v: %v", infile, err)
 		}
@@ -445,10 +443,7 @@ func (r *Reader) open() error {
 	}
 	r.reader = bufio.NewReaderSize(r.file, defaultFileBuffer)
 	if r.compressed {
-		r.reader, err = gzip.NewReader(r.reader)
-		if err != nil {
-			return fmt.Errorf("Unable to open gzip reader on %v: %v", r.file.Name(), err)
-		}
+		r.reader = snappy.NewReader(r.reader)
 	}
 	if r.position > 0 {
 		// Read to the correct offset
@@ -503,7 +498,7 @@ func sequenceToFilename(seq int64) string {
 
 func filenameToSequence(filename string) int64 {
 	_, filePart := filepath.Split(filename)
-	filePart = strings.TrimSuffix(filePart, ".gz")
+	filePart = strings.TrimSuffix(filePart, compressedSuffix)
 	seq, err := strconv.ParseInt(filePart, 10, 64)
 	if err != nil {
 		log.Errorf("Unparseable filename '%v': %v", filename, err)
