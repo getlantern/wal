@@ -57,7 +57,7 @@ func (fb *filebased) filename() string {
 type WAL struct {
 	filebased
 	syncImmediate bool
-	snappyWriter  *snappy.Writer
+	writer        *snappy.Writer
 	mx            sync.Mutex
 }
 
@@ -147,9 +147,9 @@ func appendSentinels(dir string) error {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
 		defer file.Close()
-		snappyWriter := snappy.NewBufferedWriter(file)
-		defer snappyWriter.Close()
-		_, sentinelErr = snappyWriter.Write(sentinelBytes)
+		writer := snappy.NewBufferedWriter(file)
+		defer writer.Close()
+		_, sentinelErr = writer.Write(sentinelBytes)
 		if sentinelErr != nil {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
 		}
@@ -173,14 +173,14 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	lenBuf := make([]byte, 4)
 	encoding.PutUint32(lenBuf, uint32(length))
-	n, err := wal.snappyWriter.Write(lenBuf)
+	n, err := wal.writer.Write(lenBuf)
 	wal.position += int64(n)
 	if err != nil {
 		return 0, err
 	}
 
 	for _, b := range bufs {
-		n, err = wal.snappyWriter.Write(b)
+		n, err = wal.writer.Write(b)
 		if err != nil {
 			return 0, err
 		}
@@ -193,11 +193,11 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	if wal.position >= maxSegmentSize {
 		// Write sentinel length to mark end of file
-		_, err = wal.snappyWriter.Write(sentinelBytes)
+		_, err = wal.writer.Write(sentinelBytes)
 		if err != nil {
 			return 0, err
 		}
-		err = wal.snappyWriter.Close()
+		err = wal.writer.Close()
 		if err != nil {
 			return 0, err
 		}
@@ -234,6 +234,30 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 	return nil
 }
 
+// CompressBefore compresses all data prior to the given offset on disk.
+func (wal *WAL) CompressBefore(o Offset) error {
+	files, err := ioutil.ReadDir(wal.dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list log files to delete: %v", err)
+	}
+
+	cutoff := sequenceToFilename(o.FileSequence())
+	for i, file := range files {
+		if i == len(files)-1 || file.Name() >= cutoff {
+			// Files are sorted by name, if we've gotten past the cutoff or
+			// encountered the last (active) file, don't bother continuing.
+			break
+		}
+		rmErr := os.Remove(filepath.Join(wal.dir, file.Name()))
+		if rmErr != nil {
+			return rmErr
+		}
+		log.Debugf("Removed WAL file %v", filepath.Join(wal.dir, file.Name()))
+	}
+
+	return nil
+}
+
 // TruncateBeforeTime truncates WAL data prior to the given timestamp.
 func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 	return wal.TruncateBefore(newOffset(tsToFileSequence(ts), 0))
@@ -241,7 +265,7 @@ func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
-	snappyErr := wal.snappyWriter.Close()
+	snappyErr := wal.writer.Close()
 	closeErr := wal.file.Close()
 	if snappyErr != nil {
 		return snappyErr
@@ -254,7 +278,7 @@ func (wal *WAL) advance() error {
 	wal.position = 0
 	err := wal.openFile()
 	if err == nil {
-		wal.snappyWriter = snappy.NewWriter(wal.file)
+		wal.writer = snappy.NewWriter(wal.file)
 	}
 	return err
 }
@@ -269,7 +293,7 @@ func (wal *WAL) sync(syncInterval time.Duration) {
 }
 
 func (wal *WAL) doSync() {
-	err := wal.snappyWriter.Flush()
+	err := wal.writer.Flush()
 	if err != nil {
 		log.Errorf("Unable to flush wal: %v", err)
 		return
@@ -348,7 +372,7 @@ top:
 
 			for {
 				n, err := r.reader.Read(lenBuf[read:])
-				if err == io.EOF && n == 0 {
+				if err != nil && err.Error() == "EOF" && n == 0 {
 					time.Sleep(50 * time.Millisecond)
 					continue
 				}
@@ -375,7 +399,7 @@ top:
 		read = 0
 		for {
 			n, err := r.reader.Read(b[read:])
-			if err == io.EOF && n == 0 {
+			if err != nil && err.Error() == "EOF" && n == 0 {
 				files, err := ioutil.ReadDir(r.dir)
 				if err != nil {
 					return nil, fmt.Errorf("Unable to list existing log files: %v", err)
