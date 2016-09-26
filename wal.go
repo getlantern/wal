@@ -103,6 +103,10 @@ func appendSentinels(dir string) error {
 	}
 
 	for _, fileInfo := range files {
+		if strings.HasSuffix(fileInfo.Name(), compressedSuffix) {
+			// Ignore compressed files
+			continue
+		}
 		file, sentinelErr := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
 		if sentinelErr != nil {
 			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
