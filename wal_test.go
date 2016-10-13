@@ -1,9 +1,11 @@
 package wal
 
 import (
+	"github.com/golang/snappy"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,22 +99,48 @@ func TestWAL(t *testing.T) {
 		return
 	}
 
-	// Read the full WAL again
-	r, err = wal.NewReader(nil)
-	if !assert.NoError(t, err) {
-		return
-	}
-	defer r.Close()
+	assertWALContents := func(entries []string) {
+		// Read the full WAL again
+		r, err = wal.NewReader(nil)
+		if !assert.NoError(t, err) {
+			return
+		}
+		defer r.Close()
 
-	for _, expected := range []string{"1", "2", "3"} {
-		b, readErr := r.Read()
-		if !assert.NoError(t, readErr) {
-			return
-		}
-		if !assert.Equal(t, expected, string(b)) {
-			return
+		for _, expected := range entries {
+			b, readErr := r.Read()
+			if !assert.NoError(t, readErr) {
+				return
+			}
+			if !assert.Equal(t, expected, string(b)) {
+				return
+			}
 		}
 	}
+
+	assertWALContents([]string{"1", "2", "3"})
+
+	// Corrupt the Snappy WAL file
+	files, _ := ioutil.ReadDir(dir)
+	for _, fi := range files {
+		name := filepath.Join(dir, fi.Name())
+		file, _ := os.OpenFile(name, os.O_RDWR, 0644)
+		if strings.HasSuffix(name, compressedSuffix) {
+			log.Debugf("Corrupting %v (%d)", name, fi.Size())
+			w := snappy.NewWriter(file)
+			lenBuf := make([]byte, 4)
+			encoding.PutUint32(lenBuf, 100)
+			_, err := w.Write(lenBuf)
+			if err != nil {
+				panic(err)
+			}
+			w.Flush()
+			file.Write([]byte("garbage"))
+		}
+		file.Close()
+	}
+
+	assertWALContents([]string{"2", "3"})
 
 	// Reader opened at prior offset should only get "3"
 	b, readErr := r2.Read()

@@ -388,6 +388,10 @@ top:
 					time.Sleep(50 * time.Millisecond)
 					continue
 				}
+				if err != nil {
+					log.Errorf("Unexpected error reading length from WAL file %v: %v", r.filename(), err)
+					break
+				}
 				read += n
 				r.position += int64(n)
 				if read == 4 {
@@ -424,6 +428,12 @@ top:
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
+
+			if err != nil {
+				log.Errorf("Unexpected error reading data from WAL file %v: %v", r.filename(), err)
+				continue top
+			}
+
 			read += n
 			r.position += int64(n)
 			if read == length {
