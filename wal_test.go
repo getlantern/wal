@@ -39,7 +39,7 @@ func TestWAL(t *testing.T) {
 	}
 	defer wal.Close()
 
-	r, err := wal.NewReader(nil)
+	r, err := wal.NewReader("test", nil)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -83,7 +83,7 @@ func TestWAL(t *testing.T) {
 	}
 	defer wal.Close()
 
-	r2, err := wal.NewReader(r.Offset())
+	r2, err := wal.NewReader("test", r.Offset())
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -101,7 +101,7 @@ func TestWAL(t *testing.T) {
 
 	assertWALContents := func(entries []string) {
 		// Read the full WAL again
-		r, err = wal.NewReader(nil)
+		r, err = wal.NewReader("test", nil)
 		if !assert.NoError(t, err) {
 			return
 		}
@@ -126,7 +126,6 @@ func TestWAL(t *testing.T) {
 		name := filepath.Join(dir, fi.Name())
 		file, _ := os.OpenFile(name, os.O_RDWR, 0644)
 		if strings.HasSuffix(name, compressedSuffix) {
-			log.Debugf("Corrupting %v (%d)", name, fi.Size())
 			w := snappy.NewWriter(file)
 			lenBuf := make([]byte, 4)
 			encoding.PutUint32(lenBuf, 100)

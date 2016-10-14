@@ -24,8 +24,6 @@ const (
 )
 
 var (
-	log = golog.LoggerFor("wal")
-
 	maxSegmentSize = int64(104857600)
 	encoding       = binary.BigEndian
 	sentinelBytes  = make([]byte, 4) // same as 0
@@ -38,6 +36,7 @@ type filebased struct {
 	fileSequence int64
 	position     int64
 	fileFlags    int
+	log          golog.Logger
 }
 
 func (fb *filebased) openFile() error {
@@ -45,15 +44,21 @@ func (fb *filebased) openFile() error {
 	if fb.file != nil {
 		err = fb.file.Close()
 		if err != nil {
-			log.Errorf("Unable to close existing file %v: %v", fb.file.Name(), err)
+			fb.log.Errorf("Unable to close existing file %v: %v", fb.file.Name(), err)
 		}
 	}
+
 	fb.compressed = false
 	fb.file, err = os.OpenFile(fb.filename(), fb.fileFlags, 0600)
+
 	if os.IsNotExist(err) {
 		// Try compressed version
 		fb.compressed = true
 		fb.file, err = os.OpenFile(fb.filename()+compressedSuffix, fb.fileFlags, 0600)
+	}
+
+	if err == nil {
+		fb.log.Debugf("Opened %v", fb.filename())
 	}
 	return err
 }
@@ -80,7 +85,13 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 		return nil, err
 	}
 
-	wal := &WAL{filebased: filebased{dir: dir, fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY}}
+	wal := &WAL{
+		filebased: filebased{
+			dir:       dir,
+			fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY,
+			log:       golog.LoggerFor("wal"),
+		},
+	}
 	err = wal.advance()
 	if err != nil {
 		return nil, err
@@ -193,7 +204,7 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 		if rmErr != nil {
 			return rmErr
 		}
-		log.Debugf("Removed WAL file %v", filepath.Join(wal.dir, file.Name()))
+		wal.log.Debugf("Removed WAL file %v", filepath.Join(wal.dir, file.Name()))
 	}
 
 	return nil
@@ -251,7 +262,7 @@ func (wal *WAL) CompressBefore(o Offset) error {
 		if err != nil {
 			return fmt.Errorf("Unable to remove uncompressed file %v: %v", infile, err)
 		}
-		log.Debugf("Compressed WAL file %v", infile)
+		wal.log.Debugf("Compressed WAL file %v", infile)
 	}
 
 	return nil
@@ -298,12 +309,12 @@ func (wal *WAL) sync(syncInterval time.Duration) {
 func (wal *WAL) doSync() {
 	err := wal.writer.Flush()
 	if err != nil {
-		log.Errorf("Unable to flush wal: %v", err)
+		wal.log.Errorf("Unable to flush wal: %v", err)
 		return
 	}
 	err = wal.file.Sync()
 	if err != nil {
-		log.Errorf("Unable to sync wal: %v", err)
+		wal.log.Errorf("Unable to sync wal: %v", err)
 	}
 }
 
@@ -324,13 +335,20 @@ type Reader struct {
 
 // NewReader constructs a new Reader for reading from this WAL starting at the
 // given offset. The returned Reader is NOT safe for use from multiple
-// goroutines.
-func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
-	r := &Reader{filebased: filebased{dir: wal.dir, fileFlags: os.O_RDONLY}, wal: wal}
+// goroutines. Name is just a label for the reader used during logging.
+func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
+	r := &Reader{
+		filebased: filebased{
+			dir:       wal.dir,
+			fileFlags: os.O_RDONLY,
+			log:       golog.LoggerFor("wal." + name),
+		},
+		wal: wal,
+	}
 	if offset != nil {
 		offsetString := sequenceToFilename(offset.FileSequence())
 		if offsetString[0] != '0' {
-			log.Debugf("Converting legacy offset")
+			wal.log.Debugf("Converting legacy offset")
 			offset = newOffset(offset.FileSequence()/1000, offset.Position())
 		}
 
@@ -366,7 +384,7 @@ func (wal *WAL) NewReader(offset Offset) (*Reader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Unable to advance initially: %v", err)
 		}
-		log.Debugf("Replaying log starting at %v", r.file.Name())
+		wal.log.Debugf("Replaying log starting at %v", r.file.Name())
 	}
 	return r, nil
 }
@@ -389,7 +407,7 @@ top:
 					continue
 				}
 				if err != nil {
-					log.Errorf("Unexpected error reading length from WAL file %v: %v", r.filename(), err)
+					r.log.Errorf("Unexpected error reading length from WAL file %v: %v", r.filename(), err)
 					break
 				}
 				read += n
@@ -417,7 +435,7 @@ top:
 			n, err := r.reader.Read(b[read:])
 			if err != nil && err.Error() == "EOF" && n == 0 {
 				if r.wal.hasMovedBeyond(r.fileSequence) {
-					log.Errorf("Out of data to read after reading %d, and WAL has moved beyond %d. Assuming WAL at %v corrupted. Advancing and continuing.", r.position, r.fileSequence, r.filename())
+					r.log.Errorf("Out of data to read after reading %d, and WAL has moved beyond %d. Assuming WAL at %v corrupted. Advancing and continuing.", r.position, r.fileSequence, r.filename())
 					err := r.advance()
 					if err != nil {
 						return nil, err
@@ -430,7 +448,7 @@ top:
 			}
 
 			if err != nil {
-				log.Errorf("Unexpected error reading data from WAL file %v: %v", r.filename(), err)
+				r.log.Errorf("Unexpected error reading data from WAL file %v: %v", r.filename(), err)
 				continue top
 			}
 
@@ -478,6 +496,7 @@ func (r *Reader) open() error {
 }
 
 func (r *Reader) advance() error {
+	r.log.Debugf("Advancing in %v", r.dir)
 	for {
 		files, err := ioutil.ReadDir(r.dir)
 		if err != nil {
@@ -521,7 +540,7 @@ func filenameToSequence(filename string) int64 {
 	filePart = strings.TrimSuffix(filePart, compressedSuffix)
 	seq, err := strconv.ParseInt(filePart, 10, 64)
 	if err != nil {
-		log.Errorf("Unparseable filename '%v': %v", filename, err)
+		fmt.Printf("Unparseable filename '%v': %v\n", filename, err)
 		return 0
 	}
 	return seq
