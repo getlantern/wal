@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"hash"
+	"hash/crc32"
 	"io"
 	"io/ioutil"
 	"os"
@@ -19,7 +21,7 @@ import (
 
 const (
 	sentinel          = 0
-	defaultFileBuffer = 65536
+	defaultFileBuffer = 2 << 16
 	compressedSuffix  = ".snappy"
 )
 
@@ -36,6 +38,7 @@ type filebased struct {
 	fileSequence int64
 	position     int64
 	fileFlags    int
+	h            hash.Hash32
 	log          golog.Logger
 }
 
@@ -80,19 +83,15 @@ type WAL struct {
 // every syncInterval. If syncInterval is 0, it will force sync on every write
 // to the WAL.
 func Open(dir string, syncInterval time.Duration) (*WAL, error) {
-	err := appendSentinels(dir)
-	if err != nil {
-		return nil, err
-	}
-
 	wal := &WAL{
 		filebased: filebased{
 			dir:       dir,
 			fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY,
+			h:         newHash(),
 			log:       golog.LoggerFor("wal"),
 		},
 	}
-	err = wal.advance()
+	err := wal.advance()
 	if err != nil {
 		return nil, err
 	}
@@ -104,34 +103,6 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	}
 
 	return wal, nil
-}
-
-func appendSentinels(dir string) error {
-	// Append sentinel values to all existing files just in case
-	files, err := ioutil.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("Unable to list existing log files: %v", err)
-	}
-
-	for _, fileInfo := range files {
-		if strings.HasSuffix(fileInfo.Name(), compressedSuffix) {
-			// Ignore compressed files
-			continue
-		}
-		file, sentinelErr := os.OpenFile(filepath.Join(dir, fileInfo.Name()), os.O_APPEND|os.O_WRONLY, 0600)
-		if sentinelErr != nil {
-			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
-		}
-		defer file.Close()
-		writer := bufio.NewWriterSize(file, defaultFileBuffer)
-		defer writer.Flush()
-		_, sentinelErr = writer.Write(sentinelBytes)
-		if sentinelErr != nil {
-			return fmt.Errorf("Unable to append sentinel to existing file %v: %v", fileInfo.Name(), sentinelErr)
-		}
-	}
-
-	return nil
 }
 
 // Write atomically writes one or more buffers to the WAL.
@@ -147,9 +118,24 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 		return 0, nil
 	}
 
-	lenBuf := make([]byte, 4)
-	encoding.PutUint32(lenBuf, uint32(length))
-	n, err := wal.writer.Write(lenBuf)
+	wal.h.Reset()
+	for _, buf := range bufs {
+		wal.h.Write(buf)
+	}
+
+	headerBuf := make([]byte, 4)
+
+	// Write length
+	encoding.PutUint32(headerBuf, uint32(length))
+	n, err := wal.writer.Write(headerBuf)
+	wal.position += int64(n)
+	if err != nil {
+		return 0, err
+	}
+
+	// Write checksum
+	encoding.PutUint32(headerBuf, wal.h.Sum32())
+	n, err = wal.writer.Write(headerBuf)
 	wal.position += int64(n)
 	if err != nil {
 		return 0, err
@@ -240,11 +226,12 @@ func (wal *WAL) CompressBefore(o Offset) error {
 			return fmt.Errorf("Unable to open input file %v for compression: %v", infile, err)
 		}
 		defer in.Close()
-		out, err := os.OpenFile(outfile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		out, err := ioutil.TempFile("", "")
 		if err != nil {
-			return fmt.Errorf("Unable to open outputfile %v to compress %v: %v", outfile, infile, err)
+			return fmt.Errorf("Unable to open temp file to compress %v: %v", infile, err)
 		}
 		defer out.Close()
+		defer os.Remove(out.Name())
 		compressedOut := snappy.NewWriter(out)
 		_, err = io.Copy(compressedOut, bufio.NewReaderSize(in, defaultFileBuffer))
 		if err != nil {
@@ -257,6 +244,10 @@ func (wal *WAL) CompressBefore(o Offset) error {
 		err = out.Close()
 		if err != nil {
 			return fmt.Errorf("Unable to close compressed output %v: %v", outfile, err)
+		}
+		err = os.Rename(out.Name(), outfile)
+		if err != nil {
+			return fmt.Errorf("Unable to move compressed output %v to final destination %v: %v", out.Name(), outfile, err)
 		}
 		err = os.Remove(infile)
 		if err != nil {
@@ -341,6 +332,7 @@ func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
 		filebased: filebased{
 			dir:       wal.dir,
 			fileFlags: os.O_RDONLY,
+			h:         newHash(),
 			log:       golog.LoggerFor("wal." + name),
 		},
 		wal: wal,
@@ -391,54 +383,49 @@ func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
 
 // Read reads the next chunk from the WAL, blocking until one is available.
 func (r *Reader) Read() ([]byte, error) {
-top:
 	for {
-		// Read length
-		lenBuf := make([]byte, 4)
-		read := 0
-		length := 0
-		for {
-			read = 0
-
-			for {
-				n, err := r.reader.Read(lenBuf[read:])
-				if err != nil && err.Error() == "EOF" && n == 0 {
-					time.Sleep(50 * time.Millisecond)
+		length, err := r.readHeader()
+		if err != nil {
+			return nil, err
+		}
+		checksum, err := r.readHeader()
+		if err != nil {
+			return nil, err
+		}
+		data, err := r.readData(length)
+		if data != nil || err != nil {
+			if data != nil {
+				r.h.Reset()
+				r.h.Write(data)
+				if checksum != int(r.h.Sum32()) {
+					r.log.Errorf("Checksum mismatch, skipping entry")
 					continue
 				}
-				if err != nil {
-					r.log.Errorf("Unexpected error reading length from WAL file %v: %v", r.filename(), err)
-					break
-				}
-				read += n
-				r.position += int64(n)
-				if read == 4 {
-					length = int(encoding.Uint32(lenBuf))
-					break
-				}
 			}
-
-			if length > sentinel {
-				break
-			}
-
-			err := r.advance()
-			if err != nil {
-				return nil, err
-			}
+			return data, err
 		}
+	}
+}
 
-		// Read data
-		b := make([]byte, length)
-		read = 0
+func (r *Reader) readHeader() (int, error) {
+	lenBuf := make([]byte, 4)
+top:
+	for {
+		length := 0
+		read := 0
+
 		for {
-			n, err := r.reader.Read(b[read:])
-			if err != nil && err.Error() == "EOF" && n == 0 {
+			n, err := r.reader.Read(lenBuf[read:])
+			read += n
+			r.position += int64(n)
+			if err != nil && err.Error() == "EOF" && read < 4 {
 				if r.wal.hasMovedBeyond(r.fileSequence) {
-					r.log.Errorf("Out of data to read after reading %d, and WAL has moved beyond %d. Assuming WAL at %v corrupted. Advancing and continuing.", r.position, r.fileSequence, r.filename())
-					err := r.advance()
-					if err != nil {
-						return nil, err
+					if read > 0 {
+						r.log.Errorf("Out of data to read after reading %d, and WAL has moved beyond %d. Assuming WAL at %v corrupted. Advancing and continuing.", r.position, r.fileSequence, r.filename())
+					}
+					advanceErr := r.advance()
+					if advanceErr != nil {
+						return 0, advanceErr
 					}
 					continue top
 				}
@@ -446,20 +433,56 @@ top:
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
-
 			if err != nil {
-				r.log.Errorf("Unexpected error reading data from WAL file %v: %v", r.filename(), err)
-				continue top
+				r.log.Errorf("Unexpected error reading header from WAL file %v: %v", r.filename(), err)
+				break
 			}
-
-			read += n
-			r.position += int64(n)
-			if read == length {
+			if read == 4 {
+				length = int(encoding.Uint32(lenBuf))
 				break
 			}
 		}
 
-		return b, nil
+		if length > sentinel {
+			return length, nil
+		}
+
+		err := r.advance()
+		if err != nil {
+			return 0, err
+		}
+	}
+}
+
+func (r *Reader) readData(length int) ([]byte, error) {
+	b := make([]byte, length)
+	read := 0
+	for {
+		n, err := r.reader.Read(b[read:])
+		read += n
+		r.position += int64(n)
+		if err != nil && err.Error() == "EOF" && read < length {
+			if r.wal.hasMovedBeyond(r.fileSequence) {
+				r.log.Errorf("Out of data to read after reading %d, and WAL has moved beyond %d. Assuming WAL at %v corrupted. Advancing and continuing.", r.position, r.fileSequence, r.filename())
+				advanceErr := r.advance()
+				if advanceErr != nil {
+					return nil, advanceErr
+				}
+				return nil, nil
+			}
+			// No newer log files, continue trying to read from this one
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if err != nil {
+			r.log.Errorf("Unexpected error reading data from WAL file %v: %v", r.filename(), err)
+			return nil, nil
+		}
+
+		if read == length {
+			return b, nil
+		}
 	}
 }
 
@@ -479,9 +502,10 @@ func (r *Reader) open() error {
 	if err != nil {
 		return err
 	}
-	r.reader = bufio.NewReaderSize(r.file, defaultFileBuffer)
 	if r.compressed {
-		r.reader = snappy.NewReader(r.reader)
+		r.reader = snappy.NewReader(r.file)
+	} else {
+		r.reader = bufio.NewReaderSize(r.file, defaultFileBuffer)
 	}
 	if r.position > 0 {
 		// Read to the correct offset
@@ -544,4 +568,8 @@ func filenameToSequence(filename string) int64 {
 		return 0
 	}
 	return seq
+}
+
+func newHash() hash.Hash32 {
+	return crc32.New(crc32.MakeTable(crc32.Castagnoli))
 }

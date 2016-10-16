@@ -135,11 +135,14 @@ func TestWAL(t *testing.T) {
 			}
 			w.Flush()
 			file.Write([]byte("garbage"))
+		} else {
+			file.Seek(-1, 2)
+			file.Write([]byte{0})
 		}
 		file.Close()
 	}
 
-	assertWALContents([]string{"2", "3"})
+	assertWALContents([]string{"3"})
 
 	// Reader opened at prior offset should only get "3"
 	b, readErr := r2.Read()
