@@ -322,6 +322,7 @@ type Reader struct {
 	filebased
 	wal    *WAL
 	reader io.Reader
+	buf    []byte
 }
 
 // NewReader constructs a new Reader for reading from this WAL starting at the
@@ -382,6 +383,9 @@ func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
 }
 
 // Read reads the next chunk from the WAL, blocking until one is available.
+// Note - the returned byte array is only safe to use until the next call to
+// Read(), at which point its contents will get overwritten. So, make a copy of
+// the bytes that you need.
 func (r *Reader) Read() ([]byte, error) {
 	for {
 		length, err := r.readHeader()
@@ -455,10 +459,18 @@ top:
 }
 
 func (r *Reader) readData(length int) ([]byte, error) {
-	b := make([]byte, length)
+	// Grow buffer
+	if cap(r.buf) < length {
+		r.buf = make([]byte, length)
+	}
+
+	// Set buffer length
+	r.buf = r.buf[:length]
+
+	// Read into buffer
 	read := 0
 	for {
-		n, err := r.reader.Read(b[read:])
+		n, err := r.reader.Read(r.buf[read:])
 		read += n
 		r.position += int64(n)
 		if err != nil && err.Error() == "EOF" && read < length {
@@ -481,7 +493,7 @@ func (r *Reader) readData(length int) ([]byte, error) {
 		}
 
 		if read == length {
-			return b, nil
+			return r.buf, nil
 		}
 	}
 }
