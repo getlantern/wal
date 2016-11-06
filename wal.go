@@ -2,7 +2,6 @@ package wal
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -106,11 +105,11 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	return wal, nil
 }
 
-// Offset returns the offset of the latest committed entry
-func (wal *WAL) Offset() (Offset, error) {
+// Latest() returns the latest entry in the WAL along with its offset
+func (wal *WAL) Latest() ([]byte, Offset, error) {
 	files, err := ioutil.ReadDir(wal.dir)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to list log files to get latest committed offset: %v", err)
+		return nil, nil, fmt.Errorf("Unable to list log files to get latest value: %v", err)
 	}
 
 	lastSeq := int64(0)
@@ -126,7 +125,7 @@ func (wal *WAL) Offset() (Offset, error) {
 		var r io.Reader
 		r, err = os.OpenFile(filepath.Join(wal.dir, filename), os.O_RDONLY, 0600)
 		if err != nil {
-			return nil, fmt.Errorf("Unable to open WAL file %v: %v", filename, err)
+			return nil, nil, fmt.Errorf("Unable to open WAL file %v: %v", filename, err)
 		}
 		if strings.HasSuffix(filename, compressedSuffix) {
 			r = snappy.NewReader(r)
@@ -135,8 +134,8 @@ func (wal *WAL) Offset() (Offset, error) {
 		}
 
 		h := newHash()
-		b := &bytes.Buffer{}
 		position := int64(0)
+		var data []byte
 		for {
 			headBuf := make([]byte, 8)
 			_, err := io.ReadFull(r, headBuf)
@@ -145,34 +144,35 @@ func (wal *WAL) Offset() (Offset, error) {
 				break
 			}
 
-			b.Reset()
 			length := int64(encoding.Uint32(headBuf))
 			checksum := uint32(encoding.Uint32(headBuf[4:]))
-			n, err := io.CopyN(b, r, length)
-			if err != nil || n < length {
+			b := make([]byte, length)
+			_, err = io.ReadFull(r, b)
+			if err != nil {
 				// upon encountering a read error, break, as we've found the end of the latest segment
 				break
 			}
 			h.Reset()
-			h.Write(b.Bytes())
+			h.Write(b)
 			if h.Sum32() != checksum {
 				// checksum failure means we've hit a corrupted entry, so we're at the end
 				break
 			}
 
+			data = b
 			position += 8 + length
 		}
 
 		if position > 0 {
-			// We found a valid entry in the current file, return offset
-			return newOffset(fileSequence, position), nil
+			// We found a valid entry in the current file, return
+			return data, newOffset(fileSequence, position), nil
 		}
 
 		lastSeq = fileSequence
 	}
 
-	// No files found with a valid entry, return 0 offset
-	return nil, nil
+	// No files found with a valid entry, return nil data and offset
+	return nil, nil, nil
 }
 
 // Write atomically writes one or more buffers to the WAL.
