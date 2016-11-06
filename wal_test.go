@@ -82,6 +82,11 @@ func TestWAL(t *testing.T) {
 		return
 	}
 	defer wal.Close()
+	lc, err := wal.Offset()
+	if !assert.NoError(t, err) {
+		return
+	}
+	assert.EqualValues(t, 9, lc.Position())
 
 	r2, err := wal.NewReader("test", r.Offset())
 	if !assert.NoError(t, err) {

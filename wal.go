@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -103,6 +104,75 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 	}
 
 	return wal, nil
+}
+
+// Offset returns the offset of the latest committed entry
+func (wal *WAL) Offset() (Offset, error) {
+	files, err := ioutil.ReadDir(wal.dir)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to list log files to get latest committed offset: %v", err)
+	}
+
+	lastSeq := int64(0)
+	for i := len(files) - 1; i >= 0; i-- {
+		file := files[i]
+		filename := file.Name()
+		fileSequence := filenameToSequence(filename)
+		if fileSequence == lastSeq {
+			// Duplicate file (compressed vs uncompressed), ignore
+			continue
+		}
+
+		var r io.Reader
+		r, err = os.OpenFile(filepath.Join(wal.dir, filename), os.O_RDONLY, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to open WAL file %v: %v", filename, err)
+		}
+		if strings.HasSuffix(filename, compressedSuffix) {
+			r = snappy.NewReader(r)
+		} else {
+			r = bufio.NewReaderSize(r, defaultFileBuffer)
+		}
+
+		h := newHash()
+		b := &bytes.Buffer{}
+		position := int64(0)
+		for {
+			headBuf := make([]byte, 8)
+			_, err := io.ReadFull(r, headBuf)
+			if err != nil {
+				// upon encountering a read error, break, as we've found the end of the latest segment
+				break
+			}
+
+			b.Reset()
+			length := int64(encoding.Uint32(headBuf))
+			checksum := uint32(encoding.Uint32(headBuf[4:]))
+			n, err := io.CopyN(b, r, length)
+			if err != nil || n < length {
+				// upon encountering a read error, break, as we've found the end of the latest segment
+				break
+			}
+			h.Reset()
+			h.Write(b.Bytes())
+			if h.Sum32() != checksum {
+				// checksum failure means we've hit a corrupted entry, so we're at the end
+				break
+			}
+
+			position += 8 + length
+		}
+
+		if position > 0 {
+			// We found a valid entry in the current file, return offset
+			return newOffset(fileSequence, position), nil
+		}
+
+		lastSeq = fileSequence
+	}
+
+	// No files found with a valid entry, return 0 offset
+	return nil, nil
 }
 
 // Write atomically writes one or more buffers to the WAL.
@@ -412,14 +482,14 @@ func (r *Reader) Read() ([]byte, error) {
 }
 
 func (r *Reader) readHeader() (int, error) {
-	lenBuf := make([]byte, 4)
+	headBuf := make([]byte, 4)
 top:
 	for {
 		length := 0
 		read := 0
 
 		for {
-			n, err := r.reader.Read(lenBuf[read:])
+			n, err := r.reader.Read(headBuf[read:])
 			read += n
 			r.position += int64(n)
 			if err != nil && err.Error() == "EOF" && read < 4 {
@@ -442,7 +512,7 @@ top:
 				break
 			}
 			if read == 4 {
-				length = int(encoding.Uint32(lenBuf))
+				length = int(encoding.Uint32(headBuf))
 				break
 			}
 		}
