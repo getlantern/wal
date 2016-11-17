@@ -250,11 +250,20 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 	}
 
 	cutoff := sequenceToFilename(o.FileSequence())
+	_, latestOffset, err := wal.Latest()
+	if err != nil {
+		return fmt.Errorf("Unable to determine latest offset: %v", err)
+	}
+	latestSequence := latestOffset.FileSequence()
 	for i, file := range files {
 		if i == len(files)-1 || file.Name() >= cutoff {
 			// Files are sorted by name, if we've gotten past the cutoff or
 			// encountered the last (active) file, don't bother continuing.
 			break
+		}
+		if filenameToSequence(file.Name()) == latestSequence {
+			// Don't delete the file containing the latest valid entry
+			continue
 		}
 		rmErr := os.Remove(filepath.Join(wal.dir, file.Name()))
 		if rmErr != nil {
