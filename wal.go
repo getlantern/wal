@@ -15,13 +15,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/getlantern/golog"
 	"github.com/golang/snappy"
 )
 
 const (
 	sentinel          = 0
-	defaultFileBuffer = 2 << 16
+	defaultFileBuffer = 2 << 16 // 64 KB
+	maxEntrySize      = 2 << 24 // 16 MB, used to restrain the building of excessively large entry buffers in certain cases of file corruption
 	compressedSuffix  = ".snappy"
 )
 
@@ -182,7 +184,12 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 	length := 0
 	for _, b := range bufs {
-		length += len(b)
+		blen := len(b)
+		if blen > maxEntrySize {
+			fmt.Printf("Ignoring wal entry of size %v exceeding %v", humanize.Bytes(uint64(blen)), humanize.Bytes(uint64(maxEntrySize)))
+			return 0, nil
+		}
+		length += blen
 	}
 	if length == 0 {
 		return 0, nil
@@ -474,6 +481,14 @@ func (r *Reader) Read() ([]byte, error) {
 		checksum, err := r.readHeader()
 		if err != nil {
 			return nil, err
+		}
+		if length > maxEntrySize {
+			fmt.Printf("Discarding wal entry of size %v exceeding %v, probably corrupted\n", humanize.Bytes(uint64(length)), humanize.Bytes(uint64(maxEntrySize)))
+			_, discardErr := io.CopyN(ioutil.Discard, r.reader, int64(length))
+			if discardErr == io.EOF {
+				discardErr = nil
+			}
+			return nil, discardErr
 		}
 		data, err := r.readData(length)
 		if data != nil || err != nil {
