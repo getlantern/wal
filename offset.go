@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 )
 
 const (
@@ -12,6 +13,11 @@ const (
 
 // Offset records an offset in the WAL
 type Offset []byte
+
+// NewOffsetForTS creates an offset for a given timestamp.
+func NewOffsetForTS(ts time.Time) Offset {
+	return newOffset(tsToFileSequence(ts), 0)
+}
 
 func newOffset(fileSequence int64, position int64) Offset {
 	o := make(Offset, OffsetSize)
