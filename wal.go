@@ -109,25 +109,22 @@ func Open(dir string, syncInterval time.Duration) (*WAL, error) {
 
 // Latest() returns the latest entry in the WAL along with its offset
 func (wal *WAL) Latest() ([]byte, Offset, error) {
-	files, err := ioutil.ReadDir(wal.dir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("Unable to list log files to get latest value: %v", err)
-	}
+	var data []byte
+	var offset Offset
 
 	lastSeq := int64(0)
-	for i := len(files) - 1; i >= 0; i-- {
-		file := files[i]
+	err := wal.forEachSegmentInReverse(func(file os.FileInfo, first bool, last bool) (bool, error) {
 		filename := file.Name()
 		fileSequence := filenameToSequence(filename)
 		if fileSequence == lastSeq {
 			// Duplicate file (compressed vs uncompressed), ignore
-			continue
+			return true, nil
 		}
 
 		var r io.Reader
-		r, err = os.OpenFile(filepath.Join(wal.dir, filename), os.O_RDONLY, 0600)
+		r, err := os.OpenFile(filepath.Join(wal.dir, filename), os.O_RDONLY, 0600)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Unable to open WAL file %v: %v", filename, err)
+			return false, fmt.Errorf("Unable to open WAL file %v: %v", filename, err)
 		}
 		if strings.HasSuffix(filename, compressedSuffix) {
 			r = snappy.NewReader(r)
@@ -137,13 +134,12 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 
 		h := newHash()
 		position := int64(0)
-		var data []byte
 		for {
 			headBuf := make([]byte, 8)
 			_, err := io.ReadFull(r, headBuf)
 			if err != nil {
 				// upon encountering a read error, break, as we've found the end of the latest segment
-				break
+				return false, nil
 			}
 
 			length := int64(encoding.Uint32(headBuf))
@@ -167,14 +163,17 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 
 		if position > 0 {
 			// We found a valid entry in the current file, return
-			return data, newOffset(fileSequence, position), nil
+			offset = newOffset(fileSequence, position)
+			return false, nil
 		}
 
 		lastSeq = fileSequence
-	}
+
+		return true, nil
+	})
 
 	// No files found with a valid entry, return nil data and offset
-	return nil, nil, nil
+	return data, offset, err
 }
 
 // Write atomically writes one or more buffers to the WAL.
@@ -251,35 +250,29 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 
 // TruncateBefore removes all data prior to the given offset from disk.
 func (wal *WAL) TruncateBefore(o Offset) error {
-	files, err := ioutil.ReadDir(wal.dir)
-	if err != nil {
-		return fmt.Errorf("Unable to list log files to delete: %v", err)
-	}
-
 	cutoff := sequenceToFilename(o.FileSequence())
 	_, latestOffset, err := wal.Latest()
 	if err != nil {
 		return fmt.Errorf("Unable to determine latest offset: %v", err)
 	}
 	latestSequence := latestOffset.FileSequence()
-	for i, file := range files {
-		if i == len(files)-1 || file.Name() >= cutoff {
+	return wal.forEachSegment(func(file os.FileInfo, first bool, last bool) (bool, error) {
+		if last || file.Name() >= cutoff {
 			// Files are sorted by name, if we've gotten past the cutoff or
 			// encountered the last (active) file, don't bother continuing.
-			break
+			return false, nil
 		}
 		if filenameToSequence(file.Name()) == latestSequence {
 			// Don't delete the file containing the latest valid entry
-			continue
+			return true, nil
 		}
 		rmErr := os.Remove(filepath.Join(wal.dir, file.Name()))
 		if rmErr != nil {
-			return rmErr
+			return false, rmErr
 		}
 		wal.log.Debugf("Removed WAL file %v", filepath.Join(wal.dir, file.Name()))
-	}
-
-	return nil
+		return true, nil
+	})
 }
 
 // TruncateBeforeTime truncates WAL data prior to the given timestamp.
@@ -289,90 +282,130 @@ func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 
 // TruncateToSize caps the size of the WAL to the given number of bytes
 func (wal *WAL) TruncateToSize(limit int64) error {
-	files, err := ioutil.ReadDir(wal.dir)
-	if err != nil {
-		return fmt.Errorf("Unable to list log files to delete: %v", err)
-	}
-
 	seen := int64(0)
-	for i := len(files); i >= 0; i-- {
-		file := files[i]
+	return wal.forEachSegmentInReverse(func(file os.FileInfo, first bool, last bool) (bool, error) {
 		next := file.Size()
 		seen += next
 		if seen > limit {
 			fullname := filepath.Join(wal.dir, file.Name())
 			rmErr := os.Remove(fullname)
 			if rmErr != nil {
-				return rmErr
+				return false, rmErr
 			}
 			wal.log.Debugf("Removed WAL file %v", fullname)
 		}
-	}
-
-	return nil
+		return true, nil
+	})
 }
 
 // CompressBefore compresses all data prior to the given offset on disk.
 func (wal *WAL) CompressBefore(o Offset) error {
-	files, err := ioutil.ReadDir(wal.dir)
-	if err != nil {
-		return fmt.Errorf("Unable to list log files to delete: %v", err)
-	}
-
 	cutoff := sequenceToFilename(o.FileSequence())
-	for i, file := range files {
-		if i == len(files)-1 || file.Name() >= cutoff {
+	return wal.forEachSegment(func(file os.FileInfo, first bool, last bool) (bool, error) {
+		if last || file.Name() >= cutoff {
 			// Files are sorted by name, if we've gotten past the cutoff or
 			// encountered the last (active) file, don't bother continuing.
-			break
+			return false, nil
 		}
-		infile := filepath.Join(wal.dir, file.Name())
-		outfile := infile + compressedSuffix
-		if strings.HasSuffix(file.Name(), compressedSuffix) {
-			// Already compressed
-			continue
-		}
-		in, err := os.OpenFile(infile, os.O_RDONLY, 0600)
-		if err != nil {
-			return fmt.Errorf("Unable to open input file %v for compression: %v", infile, err)
-		}
-		defer in.Close()
-		out, err := ioutil.TempFile("", "")
-		if err != nil {
-			return fmt.Errorf("Unable to open temp file to compress %v: %v", infile, err)
-		}
-		defer out.Close()
-		defer os.Remove(out.Name())
-		compressedOut := snappy.NewWriter(out)
-		_, err = io.Copy(compressedOut, bufio.NewReaderSize(in, defaultFileBuffer))
-		if err != nil {
-			return fmt.Errorf("Unable to compress %v: %v", infile, err)
-		}
-		err = compressedOut.Close()
-		if err != nil {
-			return fmt.Errorf("Unable to finalize compression of %v: %v", infile, err)
-		}
-		err = out.Close()
-		if err != nil {
-			return fmt.Errorf("Unable to close compressed output %v: %v", outfile, err)
-		}
-		err = os.Rename(out.Name(), outfile)
-		if err != nil {
-			return fmt.Errorf("Unable to move compressed output %v to final destination %v: %v", out.Name(), outfile, err)
-		}
-		err = os.Remove(infile)
-		if err != nil {
-			return fmt.Errorf("Unable to remove uncompressed file %v: %v", infile, err)
-		}
-		wal.log.Debugf("Compressed WAL file %v", infile)
-	}
-
-	return nil
+		return wal.compress(file)
+	})
 }
 
 // CompressBeforeTime compresses all data prior to the given offset on disk.
 func (wal *WAL) CompressBeforeTime(ts time.Time) error {
 	return wal.CompressBefore(newOffset(tsToFileSequence(ts), 0))
+}
+
+// CompressBeforeSize compresses all segments prior to the given size
+func (wal *WAL) CompressBeforeSize(limit int64) error {
+	seen := int64(0)
+	return wal.forEachSegmentInReverse(func(file os.FileInfo, first bool, last bool) (bool, error) {
+		if last {
+			// Don't compress the last (active) file
+			return true, nil
+		}
+		next := file.Size()
+		seen += next
+		if seen > limit {
+			return wal.compress(file)
+		}
+		return true, nil
+	})
+}
+
+func (wal *WAL) compress(file os.FileInfo) (bool, error) {
+	infile := filepath.Join(wal.dir, file.Name())
+	outfile := infile + compressedSuffix
+	if strings.HasSuffix(file.Name(), compressedSuffix) {
+		// Already compressed
+		return true, nil
+	}
+	in, err := os.OpenFile(infile, os.O_RDONLY, 0600)
+	if err != nil {
+		return false, fmt.Errorf("Unable to open input file %v for compression: %v", infile, err)
+	}
+	defer in.Close()
+	out, err := ioutil.TempFile("", "")
+	if err != nil {
+		return false, fmt.Errorf("Unable to open temp file to compress %v: %v", infile, err)
+	}
+	defer out.Close()
+	defer os.Remove(out.Name())
+	compressedOut := snappy.NewWriter(out)
+	_, err = io.Copy(compressedOut, bufio.NewReaderSize(in, defaultFileBuffer))
+	if err != nil {
+		return false, fmt.Errorf("Unable to compress %v: %v", infile, err)
+	}
+	err = compressedOut.Close()
+	if err != nil {
+		return false, fmt.Errorf("Unable to finalize compression of %v: %v", infile, err)
+	}
+	err = out.Close()
+	if err != nil {
+		return false, fmt.Errorf("Unable to close compressed output %v: %v", outfile, err)
+	}
+	err = os.Rename(out.Name(), outfile)
+	if err != nil {
+		return false, fmt.Errorf("Unable to move compressed output %v to final destination %v: %v", out.Name(), outfile, err)
+	}
+	err = os.Remove(infile)
+	if err != nil {
+		return false, fmt.Errorf("Unable to remove uncompressed file %v: %v", infile, err)
+	}
+	wal.log.Debugf("Compressed WAL file %v", infile)
+	return true, nil
+}
+
+func (wal *WAL) forEachSegment(cb func(file os.FileInfo, first bool, last bool) (bool, error)) error {
+	files, err := ioutil.ReadDir(wal.dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list log segments: %v", err)
+	}
+
+	for i, file := range files {
+		more, err := cb(file, i == 0, i == len(files)-1)
+		if !more || err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (wal *WAL) forEachSegmentInReverse(cb func(file os.FileInfo, first bool, last bool) (bool, error)) error {
+	files, err := ioutil.ReadDir(wal.dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list log segments: %v", err)
+	}
+
+	for i := len(files) - 1; i >= 0; i-- {
+		more, err := cb(files[i], i == 0, i == len(files)-1)
+		if !more || err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Close closes the wal, including flushing any unsaved writes.

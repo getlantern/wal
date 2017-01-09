@@ -46,6 +46,7 @@ func TestWAL(t *testing.T) {
 	defer r.Close()
 
 	testReadWrite := func(val string) bool {
+		wal.log.Debug(1)
 		n, readErr := wal.Write([]byte(val))
 		if !assert.NoError(t, readErr) {
 			return false
@@ -54,6 +55,7 @@ func TestWAL(t *testing.T) {
 			return false
 		}
 
+		wal.log.Debug(2)
 		b, readErr := r.Read()
 		if !assert.NoError(t, readErr) {
 			return false
@@ -64,6 +66,7 @@ func TestWAL(t *testing.T) {
 		if !assert.Equal(t, val, string(b[:1])) {
 			return false
 		}
+		wal.log.Debug(3)
 
 		return true
 	}
@@ -95,6 +98,7 @@ func TestWAL(t *testing.T) {
 	}
 	defer r2.Close()
 
+	// Problem is here
 	if !testReadWrite("3") {
 		return
 	}
