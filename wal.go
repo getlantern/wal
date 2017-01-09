@@ -287,6 +287,31 @@ func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
 	return wal.TruncateBefore(newOffset(tsToFileSequence(ts), 0))
 }
 
+// TruncateToSize caps the size of the WAL to the given number of bytes
+func (wal *WAL) TruncateToSize(limit int64) error {
+	files, err := ioutil.ReadDir(wal.dir)
+	if err != nil {
+		return fmt.Errorf("Unable to list log files to delete: %v", err)
+	}
+
+	seen := int64(0)
+	for i := len(files); i >= 0; i-- {
+		file := files[i]
+		next := file.Size()
+		seen += next
+		if seen > limit {
+			fullname := filepath.Join(wal.dir, file.Name())
+			rmErr := os.Remove(fullname)
+			if rmErr != nil {
+				return rmErr
+			}
+			wal.log.Debugf("Removed WAL file %v", fullname)
+		}
+	}
+
+	return nil
+}
+
 // CompressBefore compresses all data prior to the given offset on disk.
 func (wal *WAL) CompressBefore(o Offset) error {
 	files, err := ioutil.ReadDir(wal.dir)

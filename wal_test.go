@@ -171,6 +171,10 @@ func TestWAL(t *testing.T) {
 	// Truncate as of now, which should remove old log segment
 	truncateErr = wal.TruncateBeforeTime(time.Now())
 	testTruncate(t, wal, truncateErr, 1)
+
+	// Truncate to size 1, which should remove remaining log segment
+	truncateErr = wal.TruncateToSize(1)
+	testTruncate(t, wal, truncateErr, 0)
 }
 
 func testTruncate(t *testing.T, wal *WAL, err error, expectedSegments int) {
