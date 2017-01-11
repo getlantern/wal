@@ -40,6 +40,21 @@ func (o Offset) Position() int64 {
 	return int64(binary.BigEndian.Uint64(o[8:]))
 }
 
+func (a Offset) After(b Offset) bool {
+	sequenceA := a.FileSequence()
+	sequenceB := b.FileSequence()
+	if sequenceA > sequenceB {
+		return true
+	}
+	if sequenceA < sequenceB {
+		return false
+	}
+
+	positionA := a.Position()
+	positionB := b.Position()
+	return positionA > positionB
+}
+
 func (o Offset) String() string {
 	return fmt.Sprintf("%d:%d", o.FileSequence(), o.Position())
 }

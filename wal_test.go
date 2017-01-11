@@ -20,6 +20,23 @@ func TestFileNaming(t *testing.T) {
 	assert.Equal(t, seq, filenameToSequence(filename))
 }
 
+func TestOffsetAfter(t *testing.T) {
+	assert.True(t, newOffset(0, 1).After(nil))
+	assert.False(t, Offset(nil).After(newOffset(0, 1)))
+
+	assert.True(t, newOffset(1, 0).After(nil))
+	assert.False(t, Offset(nil).After(newOffset(1, 0)))
+
+	assert.True(t, newOffset(1, 50).After(newOffset(1, 0)))
+	assert.False(t, newOffset(1, 0).After(newOffset(1, 50)))
+
+	assert.True(t, newOffset(2, 0).After(newOffset(1, 50)))
+	assert.False(t, newOffset(1, 50).After(newOffset(2, 0)))
+
+	assert.False(t, Offset(nil).After(Offset(nil)))
+	assert.False(t, newOffset(1, 50).After(newOffset(1, 50)))
+}
+
 func TestWAL(t *testing.T) {
 	origMaxSegmentSize := maxSegmentSize
 	defer func() {
