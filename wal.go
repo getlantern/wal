@@ -410,8 +410,10 @@ func (wal *WAL) forEachSegmentInReverse(cb func(file os.FileInfo, first bool, la
 
 // Close closes the wal, including flushing any unsaved writes.
 func (wal *WAL) Close() error {
+	wal.mx.Lock()
 	flushErr := wal.writer.Flush()
 	syncErr := wal.file.Sync()
+	wal.mx.Unlock()
 	closeErr := wal.file.Close()
 	if flushErr != nil {
 		return flushErr
