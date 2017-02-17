@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -469,6 +470,7 @@ type Reader struct {
 	wal    *WAL
 	reader io.Reader
 	buf    []byte
+	closed int32
 }
 
 // NewReader constructs a new Reader for reading from this WAL starting at the
@@ -573,6 +575,9 @@ top:
 		read := 0
 
 		for {
+			if atomic.LoadInt32(&r.closed) == 1 {
+				return 0, io.ErrUnexpectedEOF
+			}
 			n, err := r.reader.Read(headBuf[read:])
 			read += n
 			r.position += int64(n)
@@ -624,6 +629,9 @@ func (r *Reader) readData(length int) ([]byte, error) {
 	// Read into buffer
 	read := 0
 	for {
+		if atomic.LoadInt32(&r.closed) == 1 {
+			return nil, io.ErrUnexpectedEOF
+		}
 		n, err := r.reader.Read(r.buf[read:])
 		read += n
 		r.position += int64(n)
@@ -660,6 +668,7 @@ func (r *Reader) Offset() Offset {
 
 // Close closes the Reader.
 func (r *Reader) Close() error {
+	atomic.StoreInt32(&r.closed, 1)
 	return r.file.Close()
 }
 
