@@ -697,6 +697,10 @@ func (r *Reader) open() error {
 func (r *Reader) advance() error {
 	r.log.Debugf("Advancing in %v", r.dir)
 	for {
+		if atomic.LoadInt32(&r.closed) == 1 {
+			return io.ErrUnexpectedEOF
+		}
+
 		files, err := ioutil.ReadDir(r.dir)
 		if err != nil {
 			return fmt.Errorf("Unable to list existing log files: %v", err)
