@@ -64,7 +64,10 @@ func (fb *filebased) openFile() error {
 	}
 
 	if err == nil {
-		fb.log.Debugf("Opened %v", fb.filename())
+		filename := fb.filename()
+		seq := filenameToSequence(filename)
+		ts := sequenceToTime(seq)
+		fb.log.Debugf("Opened %v (%v)", filename, ts)
 	}
 	return err
 }
@@ -736,6 +739,13 @@ func tsToFileSequence(ts time.Time) int64 {
 
 func sequenceToFilename(seq int64) string {
 	return fmt.Sprintf("%019d", seq)
+}
+
+func sequenceToTime(seq int64) time.Time {
+	ts := seq * 1000
+	s := ts / int64(time.Second)
+	ns := ts % int64(time.Second)
+	return time.Unix(s, ns)
 }
 
 func filenameToSequence(filename string) int64 {
