@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"github.com/golang/snappy"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -9,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/snappy"
+	"github.com/oxtoacart/bpool"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -56,7 +57,8 @@ func TestWAL(t *testing.T) {
 	}
 	defer wal.Close()
 
-	r, err := wal.NewReader("test", nil)
+	bufferPool := bpool.NewBytePool(1, 65536)
+	r, err := wal.NewReader("test", nil, bufferPool.Get)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -109,7 +111,7 @@ func TestWAL(t *testing.T) {
 	assert.EqualValues(t, 9, lc.Position())
 	assert.Equal(t, "2", string(latest))
 
-	r2, err := wal.NewReader("test", r.Offset())
+	r2, err := wal.NewReader("test", r.Offset(), bufferPool.Get)
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -128,7 +130,7 @@ func TestWAL(t *testing.T) {
 
 	assertWALContents := func(entries []string) {
 		// Read the full WAL again
-		r, err = wal.NewReader("test", nil)
+		r, err = wal.NewReader("test", nil, bufferPool.Get)
 		if !assert.NoError(t, err) {
 			return
 		}

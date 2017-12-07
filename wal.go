@@ -470,16 +470,16 @@ func (wal *WAL) hasMovedBeyond(fileSequence int64) bool {
 // from multiple goroutines.
 type Reader struct {
 	filebased
-	wal    *WAL
-	reader io.Reader
-	buf    []byte
-	closed int32
+	wal          *WAL
+	reader       io.Reader
+	bufferSource func() []byte
+	closed       int32
 }
 
 // NewReader constructs a new Reader for reading from this WAL starting at the
 // given offset. The returned Reader is NOT safe for use from multiple
 // goroutines. Name is just a label for the reader used during logging.
-func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
+func (wal *WAL) NewReader(name string, offset Offset, bufferSource func() []byte) (*Reader, error) {
 	r := &Reader{
 		filebased: filebased{
 			dir:       wal.dir,
@@ -487,7 +487,8 @@ func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
 			h:         newHash(),
 			log:       golog.LoggerFor("wal." + name),
 		},
-		wal: wal,
+		wal:          wal,
+		bufferSource: bufferSource,
 	}
 	if offset != nil {
 		offsetString := sequenceToFilename(offset.FileSequence())
@@ -534,9 +535,6 @@ func (wal *WAL) NewReader(name string, offset Offset) (*Reader, error) {
 }
 
 // Read reads the next chunk from the WAL, blocking until one is available.
-// Note - the returned byte array is only safe to use until the next call to
-// Read(), at which point its contents will get overwritten. So, make a copy of
-// the bytes that you need.
 func (r *Reader) Read() ([]byte, error) {
 	for {
 		length, err := r.readHeader()
@@ -621,13 +619,14 @@ top:
 }
 
 func (r *Reader) readData(length int) ([]byte, error) {
-	// Grow buffer
-	if cap(r.buf) < length {
-		r.buf = make([]byte, length)
+	buf := r.bufferSource()
+	// Grow buffer if necessary
+	if cap(buf) < length {
+		buf = make([]byte, length)
 	}
 
 	// Set buffer length
-	r.buf = r.buf[:length]
+	buf = buf[:length]
 
 	// Read into buffer
 	read := 0
@@ -635,7 +634,7 @@ func (r *Reader) readData(length int) ([]byte, error) {
 		if atomic.LoadInt32(&r.closed) == 1 {
 			return nil, io.ErrUnexpectedEOF
 		}
-		n, err := r.reader.Read(r.buf[read:])
+		n, err := r.reader.Read(buf[read:])
 		read += n
 		r.position += int64(n)
 		if err != nil && err.Error() == "EOF" && read < length {
@@ -658,7 +657,7 @@ func (r *Reader) readData(length int) ([]byte, error) {
 		}
 
 		if read == length {
-			return r.buf, nil
+			return buf, nil
 		}
 	}
 }
