@@ -40,6 +40,10 @@ func (o Offset) Position() int64 {
 	return int64(binary.BigEndian.Uint64(o[8:]))
 }
 
+func (o Offset) TS() time.Time {
+	return sequenceToTime(o.FileSequence())
+}
+
 func (a Offset) After(b Offset) bool {
 	sequenceA := a.FileSequence()
 	sequenceB := b.FileSequence()
