@@ -146,7 +146,7 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 	var offset Offset
 
 	lastSeq := int64(0)
-	err := wal.forEachSegment(func(file os.FileInfo, first bool, last bool) (bool, error) {
+	err := wal.forEachSegmentInReverse(func(file os.FileInfo, first bool, last bool) (bool, error) {
 		filename := file.Name()
 		fileSequence := filenameToSequence(filename)
 		if fileSequence == lastSeq {
@@ -197,7 +197,7 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 
 		if position > 0 {
 			offset = newOffset(fileSequence, position)
-			return true, nil
+			return false, nil
 		}
 
 		lastSeq = fileSequence
