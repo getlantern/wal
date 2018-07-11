@@ -171,7 +171,7 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 			headBuf := make([]byte, 8)
 			_, err := io.ReadFull(r, headBuf)
 			if err != nil {
-				// upon encountering EOF, break, as we've found the end of the latest segment
+				// upon encountering a read error, break, as we've found the end of the latest segment
 				break
 			}
 
@@ -180,7 +180,7 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 			b := make([]byte, length)
 			_, err = io.ReadFull(r, b)
 			if err != nil {
-				// upon encountering EOF, break, as we've found the end of the latest segment
+				// upon encountering a read error, break, as we've found the end of the latest segment
 				break
 			}
 
