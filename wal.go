@@ -196,13 +196,14 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 		}
 
 		if position > 0 {
+			// An entry was read in the current file, set offset and stop iterating
 			offset = newOffset(fileSequence, position)
 			return false, nil
 		}
 
 		lastSeq = fileSequence
 
-		return false, nil
+		return true, nil
 	})
 
 	// No files found with a valid entry, return nil data and offset
