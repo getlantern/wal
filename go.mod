@@ -14,5 +14,4 @@ require (
 	github.com/golang/snappy v0.0.1
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c
 	github.com/stretchr/testify v1.3.0
-	google.golang.org/appengine v1.6.1
 )

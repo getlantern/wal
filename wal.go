@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/getlantern/errors"
 	"github.com/getlantern/golog"
 	"github.com/golang/snappy"
 )
@@ -80,32 +81,79 @@ func (fb *filebased) filename() string {
 // safe to write to a single WAL from multiple goroutines.
 type WAL struct {
 	filebased
-	syncImmediate bool
-	writer        *bufio.Writer
-	mx            sync.RWMutex
+	syncImmediate   bool
+	writer          *bufio.Writer
+	backlog         chan [][]byte
+	backlogFinished chan interface{}
+	closeOnce       sync.Once
+	closed          chan interface{}
+	mx              sync.RWMutex
 }
 
-// Open opens a WAL in the given directory. It will be force synced to disk
-// every syncInterval. If syncInterval is 0, it will force sync on every write
-// to the WAL.
-func Open(dir string, syncInterval time.Duration) (*WAL, error) {
+type Opts struct {
+	// Dir is the location of the WAL
+	Dir string
+
+	// SyncInterval determines how frequently to force an fsync to flush data to disk.
+	// If syncInterval is 0, it will force sync on every write to the WAL.
+	SyncInterval time.Duration
+
+	// MaxMemoryBacklog determines the maximum number of writes that will be held in memory
+	// pending write to the WAL. Set this to 0 to use no backlog, set to a value greater than 0
+	// to allow buffering in memory. This can be useful to avoid slowing down clients while background
+	// fsync takes place.
+	MaxMemoryBacklog int
+}
+
+// Open opens a WAL in the given directory with the given options.
+func Open(opts *Opts) (*WAL, error) {
 	wal := &WAL{
 		filebased: filebased{
-			dir:       dir,
+			dir:       opts.Dir,
 			fileFlags: os.O_CREATE | os.O_APPEND | os.O_WRONLY,
 			h:         newHash(),
 			log:       golog.LoggerFor("wal"),
 		},
+		closed: make(chan interface{}),
 	}
+
+	// Append a sentinel to the most recent file (just in case it wasn't closed correctly)
+	sentinelErr := wal.forEachSegmentInReverse(func(fi os.FileInfo, first bool, last bool) (bool, error) {
+		file, err := os.OpenFile(filepath.Join(wal.dir, fi.Name()), os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return false, err
+		}
+		defer file.Close()
+		_, err = file.Write(sentinelBytes)
+		if err != nil {
+			return false, err
+		}
+		err = file.Sync()
+		if err != nil {
+			return false, err
+		}
+		return false, nil
+	})
+	if sentinelErr != nil {
+		return nil, errors.New("Unable to append sentinel to old segment: %v", sentinelErr)
+	}
+
+	// Advance wal to get a new segment file
 	err := wal.advance()
 	if err != nil {
 		return nil, err
 	}
 
-	if syncInterval <= 0 {
+	if opts.SyncInterval <= 0 {
 		wal.syncImmediate = true
 	} else {
-		go wal.sync(syncInterval)
+		if opts.MaxMemoryBacklog > 0 {
+			wal.log.Debugf("Enabling in-memory backlog up to %d buffers", opts.MaxMemoryBacklog)
+			wal.backlog = make(chan [][]byte, opts.MaxMemoryBacklog)
+			wal.backlogFinished = make(chan interface{})
+			go wal.writeAsync()
+		}
+		go wal.sync(opts.SyncInterval)
 	}
 
 	return wal, nil
@@ -118,12 +166,20 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 
 	lastSeq := int64(0)
 	err := wal.forEachSegmentInReverse(func(file os.FileInfo, first bool, last bool) (bool, error) {
+		position := int64(0)
 		filename := file.Name()
 		fileSequence := filenameToSequence(filename)
 		if fileSequence == lastSeq {
 			// Duplicate file (compressed vs uncompressed), ignore
 			return true, nil
 		}
+
+		defer func() {
+			if position > 0 {
+				// We found a valid entry in the current file, return
+				offset = newOffset(fileSequence, position)
+			}
+		}()
 
 		var r io.Reader
 		r, err := os.OpenFile(filepath.Join(wal.dir, filename), os.O_RDONLY, 0600)
@@ -137,7 +193,6 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 		}
 
 		h := newHash()
-		position := int64(0)
 		for {
 			headBuf := make([]byte, 8)
 			_, err := io.ReadFull(r, headBuf)
@@ -165,12 +220,6 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 			position += 8 + length
 		}
 
-		if position > 0 {
-			// We found a valid entry in the current file, return
-			offset = newOffset(fileSequence, position)
-			return false, nil
-		}
-
 		lastSeq = fileSequence
 
 		return true, nil
@@ -181,21 +230,52 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 }
 
 // Write atomically writes one or more buffers to the WAL.
-func (wal *WAL) Write(bufs ...[]byte) (int, error) {
+func (wal *WAL) Write(bufs ...[]byte) error {
+	if wal.backlog != nil {
+		wal.backlog <- bufs
+		return nil
+	} else {
+		return wal.doWrite(bufs...)
+	}
+}
+
+func (wal *WAL) writeAsync() {
+	defer close(wal.backlogFinished)
+	for bufs := range wal.backlog {
+		if err := wal.doWrite(bufs...); err != nil {
+			wal.log.Errorf("Error writing to WAL!: %v", err)
+		}
+	}
+}
+
+func (wal *WAL) doWrite(bufs ...[]byte) error {
 	wal.mx.Lock()
 	defer wal.mx.Unlock()
 
 	length := 0
 	for _, b := range bufs {
 		blen := len(b)
-		if blen > maxEntrySize {
-			fmt.Printf("Ignoring wal entry of size %v exceeding %v", humanize.Bytes(uint64(blen)), humanize.Bytes(uint64(maxEntrySize)))
-			return 0, nil
-		}
 		length += blen
+		if length > maxEntrySize {
+			fmt.Printf("Ignoring wal entry of size %v exceeding %v", humanize.Bytes(uint64(blen)), humanize.Bytes(uint64(maxEntrySize)))
+			return nil
+		}
 	}
 	if length == 0 {
-		return 0, nil
+		return nil
+	}
+
+	if wal.position >= maxSegmentSize {
+		// Write sentinel length to mark end of file
+		if _, advanceErr := wal.writer.Write(sentinelBytes); advanceErr != nil {
+			return advanceErr
+		}
+		if advanceErr := wal.writer.Flush(); advanceErr != nil {
+			return advanceErr
+		}
+		if advanceErr := wal.advance(); advanceErr != nil {
+			return fmt.Errorf("Unable to advance to next file: %v", advanceErr)
+		}
 	}
 
 	wal.h.Reset()
@@ -210,7 +290,7 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	n, err := wal.writer.Write(headerBuf)
 	wal.position += int64(n)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	// Write checksum
@@ -218,13 +298,13 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 	n, err = wal.writer.Write(headerBuf)
 	wal.position += int64(n)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	for _, b := range bufs {
 		n, err = wal.writer.Write(b)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		wal.position += int64(n)
 	}
@@ -233,23 +313,7 @@ func (wal *WAL) Write(bufs ...[]byte) (int, error) {
 		wal.doSync()
 	}
 
-	if wal.position >= maxSegmentSize {
-		// Write sentinel length to mark end of file
-		_, err = wal.writer.Write(sentinelBytes)
-		if err != nil {
-			return 0, err
-		}
-		err = wal.writer.Flush()
-		if err != nil {
-			return 0, err
-		}
-		err = wal.advance()
-		if err != nil {
-			return n, fmt.Errorf("Unable to advance to next file: %v", err)
-		}
-	}
-
-	return n, nil
+	return nil
 }
 
 // TruncateBefore removes all data prior to the given offset from disk.
@@ -413,19 +477,41 @@ func (wal *WAL) forEachSegmentInReverse(cb func(file os.FileInfo, first bool, la
 }
 
 // Close closes the wal, including flushing any unsaved writes.
-func (wal *WAL) Close() error {
-	wal.mx.Lock()
-	flushErr := wal.writer.Flush()
-	syncErr := wal.file.Sync()
-	wal.mx.Unlock()
-	closeErr := wal.file.Close()
-	if flushErr != nil {
-		return flushErr
-	}
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
+func (wal *WAL) Close() (err error) {
+	wal.closeOnce.Do(func() {
+		select {
+		case <-wal.closed:
+			// already closed
+			return
+		default:
+			// continue
+		}
+
+		wal.log.Debug("Closing")
+		defer wal.log.Debug("Closed")
+
+		close(wal.closed)
+
+		if wal.backlog != nil {
+			close(wal.backlog)
+			<-wal.backlogFinished
+		}
+
+		wal.mx.Lock()
+		flushErr := wal.writer.Flush()
+		syncErr := wal.file.Sync()
+		wal.mx.Unlock()
+		closeErr := wal.file.Close()
+		if flushErr != nil {
+			err = flushErr
+		}
+		if syncErr != nil {
+			err = syncErr
+		}
+		err = closeErr
+	})
+
+	return
 }
 
 func (wal *WAL) advance() error {
@@ -441,9 +527,14 @@ func (wal *WAL) advance() error {
 func (wal *WAL) sync(syncInterval time.Duration) {
 	for {
 		time.Sleep(syncInterval)
-		wal.mx.Lock()
-		wal.doSync()
-		wal.mx.Unlock()
+		select {
+		case <-wal.closed:
+			return
+		default:
+			wal.mx.Lock()
+			wal.doSync()
+			wal.mx.Unlock()
+		}
 	}
 }
 
@@ -503,13 +594,18 @@ func (wal *WAL) NewReader(name string, offset Offset, bufferSource func() []byte
 		}
 
 		cutoff := sequenceToFilename(offset.FileSequence())
-		for _, fileInfo := range files {
+		for i, fileInfo := range files {
+			isMostRecent := i == len(files)-1
 			if fileInfo.Name() >= cutoff {
-				// Found exist or more recent WAL file
+				// Found existing or more recent WAL file
 				r.fileSequence = filenameToSequence(fileInfo.Name())
 				if r.fileSequence == offset.FileSequence() {
 					// Exact match, start at right position
 					r.position = offset.Position()
+					if r.position == fileInfo.Size() && !isMostRecent {
+						// At end of file and more recent is available, move to next
+						continue
+					}
 				} else {
 					// Newer WAL file, start at beginning
 					r.position = 0
