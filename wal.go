@@ -564,6 +564,7 @@ type Reader struct {
 	wal          *WAL
 	reader       io.Reader
 	bufferSource func() []byte
+	stopped      int32
 	closed       int32
 }
 
@@ -672,6 +673,9 @@ top:
 		read := 0
 
 		for {
+			if atomic.LoadInt32(&r.stopped) == 1 {
+				return 0, io.EOF
+			}
 			if atomic.LoadInt32(&r.closed) == 1 {
 				return 0, io.ErrUnexpectedEOF
 			}
@@ -727,6 +731,9 @@ func (r *Reader) readData(length int) ([]byte, error) {
 	// Read into buffer
 	read := 0
 	for {
+		if atomic.LoadInt32(&r.stopped) == 1 {
+			return nil, io.EOF
+		}
 		if atomic.LoadInt32(&r.closed) == 1 {
 			return nil, io.ErrUnexpectedEOF
 		}
@@ -762,6 +769,11 @@ func (r *Reader) readData(length int) ([]byte, error) {
 // call this concurrently with Read().
 func (r *Reader) Offset() Offset {
 	return newOffset(r.fileSequence, r.position)
+}
+
+// Stop stops this reader from advancing
+func (r *Reader) Stop() {
+	atomic.StoreInt32(&r.stopped, 1)
 }
 
 // Close closes the Reader.
