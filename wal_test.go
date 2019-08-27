@@ -49,9 +49,9 @@ func TestWAL(t *testing.T) {
 	if !assert.NoError(t, err) {
 		return
 	}
-	defer os.RemoveAll(dir)
+	// defer os.RemoveAll(dir)
 
-	wal, err := Open(dir, 0)
+	wal, err := Open(&Opts{Dir: dir, SyncInterval: 1 * time.Millisecond, MaxMemoryBacklog: 1})
 	if !assert.NoError(t, err) {
 		return
 	}
@@ -65,27 +65,21 @@ func TestWAL(t *testing.T) {
 	defer r.Close()
 
 	testReadWrite := func(val string) bool {
-		wal.log.Debug(1)
-		n, readErr := wal.Write([]byte(val))
+		wal.log.Debugf("testReadWrite: %v", val)
+		readErr := wal.Write([]byte(val))
 		if !assert.NoError(t, readErr) {
-			return false
-		}
-		if !assert.Equal(t, 1, n) {
 			return false
 		}
 
-		wal.log.Debug(2)
+		wal.log.Debug("Reading")
 		b, readErr := r.Read()
 		if !assert.NoError(t, readErr) {
-			return false
-		}
-		if !assert.Equal(t, len(val), n) {
 			return false
 		}
 		if !assert.Equal(t, val, string(b[:1])) {
 			return false
 		}
-		wal.log.Debug(3)
+		wal.log.Debug("Read")
 
 		return true
 	}
@@ -99,17 +93,23 @@ func TestWAL(t *testing.T) {
 
 	// Reopen WAL
 	wal.Close()
-	wal, err = Open(dir, 0)
-	if !assert.NoError(t, err) {
-		return
-	}
-	defer wal.Close()
+
 	latest, lc, err := wal.Latest()
 	if !assert.NoError(t, err) {
 		return
 	}
-	assert.EqualValues(t, 9, lc.Position())
-	assert.Equal(t, "2", string(latest))
+	if !assert.EqualValues(t, 9, lc.Position()) {
+		return
+	}
+	if !assert.Equal(t, "2", string(latest)) {
+		return
+	}
+
+	wal, err = Open(&Opts{Dir: dir, SyncInterval: 0})
+	if !assert.NoError(t, err) {
+		return
+	}
+	defer wal.Close()
 
 	r2, err := wal.NewReader("test", r.Offset(), bufferPool.Get)
 	if !assert.NoError(t, err) {
@@ -129,6 +129,7 @@ func TestWAL(t *testing.T) {
 	}
 
 	assertWALContents := func(entries []string) {
+		wal.log.Debugf("Asserting WAL contents: %v", entries)
 		// Read the full WAL again
 		r, err = wal.NewReader("test", nil, bufferPool.Get)
 		if !assert.NoError(t, err) {
@@ -164,9 +165,6 @@ func TestWAL(t *testing.T) {
 			}
 			w.Flush()
 			file.Write([]byte("garbage"))
-		} else {
-			file.Seek(-1, 2)
-			file.Write([]byte{0})
 		}
 		file.Close()
 	}
@@ -174,6 +172,7 @@ func TestWAL(t *testing.T) {
 	assertWALContents([]string{"3"})
 
 	// Reader opened at prior offset should only get "3"
+	wal.log.Debug(r2.Offset())
 	b, readErr := r2.Read()
 	if !assert.NoError(t, readErr) {
 		return
@@ -182,14 +181,14 @@ func TestWAL(t *testing.T) {
 		return
 	}
 
-	_, err = wal.Write([]byte("data to force new WAL"))
+	err = wal.Write([]byte("data to force new WAL"))
 	if !assert.NoError(t, err) {
 		return
 	}
 
 	// Truncate as of known offset, should not delete any files
-	truncateErr := wal.TruncateBefore(r.Offset())
-	testTruncate(t, wal, truncateErr, 3)
+	truncateErr := wal.TruncateBefore(r2.Offset())
+	testTruncate(t, wal, truncateErr, 2)
 
 	// Truncate as of now, which should remove old log segment
 	truncateErr = wal.TruncateBeforeTime(time.Now())
