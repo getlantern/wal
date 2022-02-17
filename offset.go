@@ -16,10 +16,10 @@ type Offset []byte
 
 // NewOffsetForTS creates an offset for a given timestamp.
 func NewOffsetForTS(ts time.Time) Offset {
-	return newOffset(tsToFileSequence(ts), 0)
+	return NewOffset(tsToFileSequence(ts), 0)
 }
 
-func newOffset(fileSequence int64, position int64) Offset {
+func NewOffset(fileSequence int64, position int64) Offset {
 	o := make(Offset, OffsetSize)
 	binary.BigEndian.PutUint64(o, uint64(fileSequence))
 	binary.BigEndian.PutUint64(o[8:], uint64(position))

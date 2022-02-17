@@ -177,7 +177,7 @@ func (wal *WAL) Latest() ([]byte, Offset, error) {
 		defer func() {
 			if position > 0 {
 				// We found a valid entry in the current file, return
-				offset = newOffset(fileSequence, position)
+				offset = NewOffset(fileSequence, position)
 			}
 		}()
 
@@ -345,7 +345,7 @@ func (wal *WAL) TruncateBefore(o Offset) error {
 
 // TruncateBeforeTime truncates WAL data prior to the given timestamp.
 func (wal *WAL) TruncateBeforeTime(ts time.Time) error {
-	return wal.TruncateBefore(newOffset(tsToFileSequence(ts), 0))
+	return wal.TruncateBefore(NewOffset(tsToFileSequence(ts), 0))
 }
 
 // TruncateToSize caps the size of the WAL to the given number of bytes
@@ -381,7 +381,7 @@ func (wal *WAL) CompressBefore(o Offset) error {
 
 // CompressBeforeTime compresses all data prior to the given offset on disk.
 func (wal *WAL) CompressBeforeTime(ts time.Time) error {
-	return wal.CompressBefore(newOffset(tsToFileSequence(ts), 0))
+	return wal.CompressBefore(NewOffset(tsToFileSequence(ts), 0))
 }
 
 // CompressBeforeSize compresses all segments prior to the given size
@@ -586,7 +586,7 @@ func (wal *WAL) NewReader(name string, offset Offset, bufferSource func() []byte
 		offsetString := sequenceToFilename(offset.FileSequence())
 		if offsetString[0] != '0' {
 			wal.log.Debugf("Converting legacy offset")
-			offset = newOffset(offset.FileSequence()/1000, offset.Position())
+			offset = NewOffset(offset.FileSequence()/1000, offset.Position())
 		}
 
 		files, err := ioutil.ReadDir(wal.dir)
@@ -768,7 +768,7 @@ func (r *Reader) readData(length int) ([]byte, error) {
 // Offset returns the furthest Offset read by this Reader. It is NOT safe to
 // call this concurrently with Read().
 func (r *Reader) Offset() Offset {
-	return newOffset(r.fileSequence, r.position)
+	return NewOffset(r.fileSequence, r.position)
 }
 
 // Stop stops this reader from advancing
